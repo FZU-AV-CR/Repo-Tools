@@ -1,0 +1,65 @@
+{
+    "metadata": {
+        "resource_type": {
+            "id": "dataset"
+        },
+        "recid": 0,
+        "creators": [
+            {
+                "person_or_org": {
+                    "name": "DELPHI Collaboration",
+                    "type": "organizational"
+                }
+            }
+        ],
+        "file_types": [
+            "sl"
+        ],
+        "title": "test",
+        "publication_date": "2024",
+        "publisher": "CERN Open Data Portal",
+        "description": "",
+        "subjects": [
+            {
+                "subject": "Higgs physics"
+            },
+            {
+                "subject": "Electron–positron collisions"
+            }
+        ],
+        "rights": [
+            {
+                "id": "cc0-1.0"
+            }
+        ],
+        "identifiers": [
+            {
+                "identifier": "",
+                "scheme": "url"
+            }
+        ],
+        "dates": [
+            {
+                "date": "",
+                "type": {
+                    "id": "created"
+                }
+            }
+        ],
+        "experiment": "DELPHI",
+        "collision_information": {
+            "type": "e+e-",
+            "energy": "",
+            "energy_min": 0,
+            "energy_max": 0
+        },
+        "category": {
+            "id": "higgs"
+        },
+        "dataset_type": "simulated",
+        "number_of_events": 0
+    },
+    "files": {
+        "enabled": true
+    }
+}

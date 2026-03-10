@@ -1,0 +1,26 @@
+{
+  "$schema": "local://datasets-v1.1.0.json",
+  "files": {
+    "enabled": true
+  },
+  "metadata": {
+    "title": "test record",
+    "publication_date": "2025-12-02",
+    "resource_type": {
+      "id": "dataset"
+    },
+    "description": "Auto-generated upload record.",
+    "creators": [
+      {
+        "person_or_org": {
+          "name": "martenson,marten Galaxy User",
+          "family_name": "Galaxy User",
+          "given_name": "martenson,marten",
+          "type": "personal",
+          "identifiers": []
+        },
+        "affiliations": []
+      }
+    ]
+  }
+}
