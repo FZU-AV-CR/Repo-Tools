@@ -1,0 +1,11 @@
+matplotlib
+plotly
+requests
+pandas
+seaborn
+ipython
+zlib
+numpy
+os
+csv
+json
