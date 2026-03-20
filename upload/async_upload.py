@@ -85,7 +85,7 @@ def fill_cern_metadata(metadata, path) -> dict:
     tgt["publication_date"] = _to_year(src.get("date_published")) or tgt.get("publication_date", "")
 
     # Record ID
-    recid = src.get("recid")
+    recid = int(src.get("recid"))
     tgt["recid"] = recid
 
     # Description: combine key narrative fields
@@ -203,6 +203,17 @@ async def create_default_client():
     return await get_async_client("physica", config=config)
 
 
+async def create_test_client():
+    config = Config()
+    config.add_repository(RepositoryConfig(
+        alias="physica-local",
+        url=URL("https://127.0.0.1:5000/"),
+        token="cDfV8k1Es0E1zxrO2Q9Lrl1w1rwiIASPEJzwlIbT9Gurf2lBqPCGVmYNjnuE",
+        verify_tls=False
+    ))
+    return await get_async_client("physica-local", config=config)
+
+
 class WeightedSemaphore:
     def __init__(self, value: int):
         self._value = value
@@ -318,7 +329,7 @@ async def upload_record_async(
 
         # Fill metadata template with actual values
         metadata = fill_cern_metadata(metadata, metadata_file)
-        # print(json.dumps(metadata, indent=2))
+        print(json.dumps(metadata, indent=2))
 
         # Create a new record
         record = await client.records.create(
@@ -457,9 +468,10 @@ async def ensure_zip_async(dataset_files: list[Path], zip_path: Path, zip_sem: a
 
 
 async def main_async() -> None:
-    client = await create_default_client()
+    # client = await create_default_client()
+    client = await create_test_client()
 
-    recid = 85104
+    recid = 83243
     metadata_dir = Path("../metadata")
     data_dir = Path("../downloads")
 
