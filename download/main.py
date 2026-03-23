@@ -7,9 +7,9 @@ Parallel DELPHI dataset downloader using cernopendata-client python modules.
 Features:
 - Finds DELPHI records via CERN Open Data REST API (includes simulated MC content).
 - Saves metadata JSON per record under metadata/<recid>.json
-- Downloads all files for each record into downloads/<recid>/
+- Downloads all files for each record into data/<recid>/
 - Uses cernopendata_client internals (get_record_as_json, get_files_list, download_single_file, ...)
-- Parallel file downloads with ThreadPoolExecutor (I/O bound).
+- Parallel file data with ThreadPoolExecutor (I/O bound).
 - Robust numeric checksum comparison (fixes leading-zero Adler32 bug).
 - Stats written to stats/download_stats.csv and errors to stats/errors.log
 - Resume-safe: skips files that already exist with matching size and checksum.
@@ -44,7 +44,7 @@ SERVER_HTTP_URI = "https://opendata.cern.ch"
 DEFAULT_OUTPUT_DIR = Path("..")
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_BASE = DEFAULT_OUTPUT_DIR
-OUTPUT_ROOT = OUTPUT_BASE / "downloads"
+OUTPUT_ROOT = OUTPUT_BASE / "data"
 METADATA_DIR = OUTPUT_BASE / "metadata"
 STATS_DIR = OUTPUT_BASE / "stats"
 STATS_CSV = STATS_DIR / "download_stats.csv"
@@ -72,7 +72,7 @@ Arguments:
   --retry-limit <int>      Retries per file before failing (default: {RETRY_LIMIT}).
   --retry-sleep <int>      Sleep seconds between retries (default: {RETRY_SLEEP}).
   --max-recid <int>        Limit number of recids processed (testing purposes).
-  --output-dir <path>      Base directory for downloads, metadata, and stats.
+  --output-dir <path>      Base directory for data, metadata, and stats.
   --verify-recid <int>     Manually verify a single recid using remote metadata, then exit.
   -h, --help               Show this help message and exit.
 """
@@ -849,14 +849,14 @@ def main(args):
                     "attempts": None,
                 })
 
-    logging.info("Progress: %d/%d (100.0%%) - all downloads processed", total_tasks, total_tasks)
+    logging.info("Progress: %d/%d (100.0%%) - all data processed", total_tasks, total_tasks)
     logging.info("All tasks finished. Stats written to %s", STATS_CSV)
 
 
 def configure_output_paths(base_dir):
     global OUTPUT_BASE, OUTPUT_ROOT, METADATA_DIR, STATS_DIR, STATS_CSV, ERROR_LOG
     OUTPUT_BASE = Path(base_dir).expanduser()
-    OUTPUT_ROOT = OUTPUT_BASE / "downloads"
+    OUTPUT_ROOT = OUTPUT_BASE / "data"
     METADATA_DIR = OUTPUT_BASE / "metadata"
     STATS_DIR = OUTPUT_BASE / "stats"
     STATS_CSV = STATS_DIR / "download_stats.csv"
@@ -896,7 +896,7 @@ if __name__ == "__main__":
         "--output-dir",
         type=str,
         default=str(DEFAULT_OUTPUT_DIR),
-        help="Base directory for all outputs (downloads/metadata/stats).",
+        help="Base directory for all outputs (data/metadata/stats).",
     )
     p.add_argument(
         "--verify-recid",

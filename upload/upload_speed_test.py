@@ -49,10 +49,10 @@ __all__ = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Upload every dataset in /downloads and log upload metrics.")
+    parser = argparse.ArgumentParser(description="Upload every dataset in /data and log upload metrics.")
     parser.add_argument("--token", help="API token (defaults to WORKFLOW_TOKEN env var).")
     parser.add_argument("--base-url", default="https://workflow-repo.test.du.cesnet.cz/api", help="API base URL.")
-    parser.add_argument("--downloads", default="downloads", help="Directory containing dataset folders.")
+    parser.add_argument("--data", default="data", help="Directory containing dataset folders.")
     parser.add_argument("--record-template", default="minimal_record.json", help="JSON template for new records.")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 4, help="Number of parallel dataset workers.")
     parser.add_argument("--stats-file", default="upload_stats.csv", help="CSV file for per-file statistics.")

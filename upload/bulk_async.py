@@ -85,7 +85,7 @@ async def main_async():
     # template_path = Path(args.template)
 
     setup_logging()
-    data_dir = Path("../downloads")
+    data_dir = Path("../data")
     metadata_dir = Path("../metadata")
     master_cache = Path("../delphi_records_master.json")
     template_path = Path("delphi_nrp_example.json")

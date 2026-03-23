@@ -473,7 +473,7 @@ async def main_async() -> None:
 
     recid = 83243
     metadata_dir = Path("../metadata")
-    data_dir = Path("../downloads")
+    data_dir = Path("../data")
 
     await upload_record_async(
         client=client,
