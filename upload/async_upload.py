@@ -197,7 +197,7 @@ async def create_default_client():
     config.add_repository(RepositoryConfig(
         alias="physica",
         url=URL("https://test1.physics.du.cesnet.cz/"),
-        token="QhrCdMuk4dYOBmIM3frzCOcKTnF28LOvA28MYGEbzZBhPy5wk2nr9thRKZGD",
+        token="qC1oSIoLnYs2rhtLZg0fDCpYtmYO4IqWmR82NUInFAWMdNyYzMJrju2NqvmO",
         verify_tls=True
     ))
     return await get_async_client("physica", config=config)
@@ -208,7 +208,7 @@ async def create_test_client():
     config.add_repository(RepositoryConfig(
         alias="physica-local",
         url=URL("https://127.0.0.1:5000/"),
-        token="cDfV8k1Es0E1zxrO2Q9Lrl1w1rwiIASPEJzwlIbT9Gurf2lBqPCGVmYNjnuE",
+        token="ttSNI0N1JzVVIi8ZAPFlkJxV53X1116ZrzkEiixdQCDxqH4303EA7hSUGHZC",
         verify_tls=False
     ))
     return await get_async_client("physica-local", config=config)
@@ -468,8 +468,8 @@ async def ensure_zip_async(dataset_files: list[Path], zip_path: Path, zip_sem: a
 
 
 async def main_async() -> None:
-    # client = await create_default_client()
-    client = await create_test_client()
+    client = await create_default_client()
+    # client = await create_test_client()
 
     recid = 83243
     metadata_dir = Path("../metadata")
