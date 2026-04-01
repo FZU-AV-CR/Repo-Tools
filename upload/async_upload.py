@@ -471,7 +471,7 @@ async def main_async() -> None:
     client = await create_default_client()
     # client = await create_test_client()
 
-    recid = 83243
+    recid = 85104
     metadata_dir = Path("../metadata")
     data_dir = Path("../data")
 
