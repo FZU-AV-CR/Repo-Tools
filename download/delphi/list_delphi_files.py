@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Export DELPHI file entries from JSON record lists into a CSV file."""
+"""
+Transform DELPHI file entries from JSON record lists from
+https://github.com/cernopendata/opendata.cern.ch/tree/master/data/records into a CSV file with the recid, file name,
+odp_path (file path on the Open Data Portal for download), file_size, checksum.
+"""
 
 from __future__ import annotations
 
