@@ -136,9 +136,10 @@ def build_master_cache(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQ
                        protocol=DOWNLOAD_PROTOCOL, limit=0):
     recids = []
     params = {"q": query, "size": page_size, "from": 1}
+    logging.info("Fetching DELPHI recids from %s with query: %s", server, query)
     if limit != 0 and page_size > limit:
         params["size"] = limit
-    logging.info("Fetching DELPHI recids from %s with query: %s", server, query)
+        logging.info("Applying recid limit %d to API page size", limit)
     limit_reached = False
     while True:
         resp = requests.get(SEARCH_API, params=params)
@@ -166,7 +167,10 @@ def build_master_cache(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQ
         logging.info("Listing progress: %d recids collected so far (page offset %s)", len(recids), params["from"])
         total = j.get("hits", {}).get("total", {}) or j.get("hits", {}).get("total")
         params["from"] += page_size
-        if params["from"] >= (total or params["from"]) or (params["from"] >= limit and limit != 0):
+        if params["from"] >= (total or params["from"]):
+            break
+        if len(recids) >= limit != 0:
+            logging.info("Reached recid limit %d; stopping listing.", limit)
             break
     recids = sorted(set(recids))
     cache_payload = {}
