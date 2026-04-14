@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-delphi_parallel_downloader.py
-
 Parallel DELPHI dataset downloader using cernopendata-client python modules.
 
 Features:
@@ -75,6 +73,9 @@ Arguments:
   --output-dir <path>      Base directory for data, metadata, and stats.
   --verify-recid <int>     Manually verify a single recid using remote metadata, then exit.
   -h, --help               Show this help message and exit.
+  
+Example usage:
+    python main.py --workers 12 --protocol xrootd
 """
 
 # Which records to query: experiment:DELPHI; include everything (simulated flagged in metadata)

@@ -81,8 +81,10 @@ def fill_cern_metadata(metadata, path) -> dict:
 
     # Title / publisher / dates
     tgt["title"] = src.get("title", tgt.get("title", ""))
-    tgt["publisher"] = src.get("publisher", tgt.get("publisher", ""))
-    tgt["publication_date"] = _to_year(src.get("date_published")) or tgt.get("publication_date", "")
+    # FZU
+    tgt["publisher"] = "FZU Institute of Physics of the Czech Academy of Sciences"
+    # Today
+    tgt["publication_date"] = time.strftime("%Y-%m-%d")
 
     # Record ID
     recid = int(src.get("recid"))
@@ -194,10 +196,17 @@ def fill_cern_metadata(metadata, path) -> dict:
 
 async def create_default_client():
     config = Config()
+    token="jvU9QNA12lAqIImQ5UwLCRozOLxBeuyanM2sBKpYY1ijur0bNYTNsplc8N1s"
+    # securely enter the token
+    if token == "":
+        token = input("Enter API token for repository: ").strip()
+
+    # try for exceptions and print user-friendly message if connection fails
+
     config.add_repository(RepositoryConfig(
         alias="physica",
         url=URL("https://test1.physics.du.cesnet.cz/"),
-        token="qC1oSIoLnYs2rhtLZg0fDCpYtmYO4IqWmR82NUInFAWMdNyYzMJrju2NqvmO",
+        token=token,
         verify_tls=True
     ))
     return await get_async_client("physica", config=config)
@@ -208,7 +217,7 @@ async def create_test_client():
     config.add_repository(RepositoryConfig(
         alias="physica-local",
         url=URL("https://127.0.0.1:5000/"),
-        token="ttSNI0N1JzVVIi8ZAPFlkJxV53X1116ZrzkEiixdQCDxqH4303EA7hSUGHZC",
+        token="BEUlmR9j8FMnRVntAgKcGtHc4vQUgYj7WEJXcDobF6uqVj71zrbYMumjx7F9",
         verify_tls=False
     ))
     return await get_async_client("physica-local", config=config)

@@ -1,0 +1,1 @@
+This folder contains scripts for downloading the data. Because little interoperability is expected, the data is grouped in folders based on the source.
