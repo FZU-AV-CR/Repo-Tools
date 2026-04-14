@@ -133,9 +133,11 @@ def load_master_cache_data(cache_path=MASTER_CACHE_JSON):
 
 
 def build_master_cache(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQUESTS_PAGE_SIZE,
-                       protocol=DOWNLOAD_PROTOCOL):
+                       protocol=DOWNLOAD_PROTOCOL, limit=0):
     recids = []
     params = {"q": query, "size": page_size, "from": 1}
+    if limit != 0 and page_size > limit:
+        params["size"] = limit
     logging.info("Fetching DELPHI recids from %s with query: %s", server, query)
     limit_reached = False
     while True:
@@ -164,7 +166,7 @@ def build_master_cache(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQ
         logging.info("Listing progress: %d recids collected so far (page offset %s)", len(recids), params["from"])
         total = j.get("hits", {}).get("total", {}) or j.get("hits", {}).get("total")
         params["from"] += page_size
-        if params["from"] >= (total or params["from"]):
+        if params["from"] >= (total or params["from"]) or (params["from"] >= limit and limit != 0):
             break
     recids = sorted(set(recids))
     cache_payload = {}
@@ -229,7 +231,7 @@ def build_master_cache(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQ
 
 
 def fetch_all_delphi_recids(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_size=REQUESTS_PAGE_SIZE,
-                            protocol=DOWNLOAD_PROTOCOL):
+                            protocol=DOWNLOAD_PROTOCOL, limit=0):
     """
     Query the REST API and return a sorted list of recid integers for query.
     Uses the public API /api/records/ with a large size value to attempt to get all results.
@@ -243,7 +245,7 @@ def fetch_all_delphi_recids(server=SERVER_HTTP_URI, query=SEARCH_QUERY, page_siz
     """
     cache_data = load_master_cache_data()
     if not cache_data or len(cache_data) == 0:
-        cache_data = build_master_cache(server=server, query=query, page_size=page_size, protocol=protocol)
+        cache_data = build_master_cache(server=server, query=query, page_size=page_size, protocol=protocol, limit=limit)
     if not cache_data:
         logging.error("Master cache is empty; nothing to process.")
         return []
@@ -785,7 +787,7 @@ def verify_single_recid(recid, protocol=DOWNLOAD_PROTOCOL):
 
 
 def main(args):
-    recids = fetch_all_delphi_recids(page_size=REQUESTS_PAGE_SIZE, protocol=args.protocol)
+    recids = fetch_all_delphi_recids(page_size=REQUESTS_PAGE_SIZE, protocol=args.protocol, limit=args.max_recids)
     if args.max_recids:
         recids = recids[: args.max_recids]
 
