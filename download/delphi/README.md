@@ -14,7 +14,7 @@ This folder contains tools for downloading DELPHI datasets from CERN Open Data, 
 ## Download target
 
 - The downloader automatically builds a file list from the CERN API, but since it can only list 10k datasets you can also supply a custom file
-- To build this file we used the Delphi records from https://github.com/cernopendata/opendata.cern.ch/tree/master/data/records 
+- To build this file we used the Delphi records from https://github.com/cernopendata/opendata.cern.ch/tree/master/data/records and `build_master_cache.py`
 
 ## Files in This Folder
 
@@ -23,6 +23,8 @@ This folder contains tools for downloading DELPHI datasets from CERN Open Data, 
 - `delphi_files.csv` - Example/generated CSV file inventory
 - `delphi_records_master.json` - Master cache of records and file states
 - `build_master_cache.py` - Script to build the master cache from the list of records
+- `stats.ipynb` - Jupyter notebook for analyzing download stats
+- `errors.ipynb` - Jupyter notebook for analyzing error logs and failures
 
 ## Requirements
 

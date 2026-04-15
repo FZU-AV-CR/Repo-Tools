@@ -75,7 +75,7 @@ Arguments:
   -h, --help               Show this help message and exit.
   
 Example usage:
-    python main.py --workers 12 --protocol xrootd
+    python main.py --workers 12 --protocol xrootd --max-recid 50
 """
 
 # Which records to query: experiment:DELPHI; include everything (simulated flagged in metadata)
