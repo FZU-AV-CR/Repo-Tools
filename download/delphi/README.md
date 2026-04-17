@@ -44,11 +44,19 @@ pip install cernopendata-client
 
 ## Quick Start
 
-Run from the project root (`C:\Users\Lenovo\PycharmProjects\test`):
+    1) Lists of Delphi datasets to be downloaded are available in the lists directory.
 
-```powershell
-python .\download\delphi\main.py --workers 12 --protocol http
-```
+        If needed, update the lists from https://github.com/cernopendata/opendata.cern.ch/tree/master/data/records
+
+    2) Run from the project root (`C:\Users\Lenovo\PycharmProjects\test`):
+    ```powershell
+        python .\download\delphi\build_master_cache.py
+    ```
+    
+    3) Run: python .\download\delphi\main.py --workers 12 --protocol xrootd
+
+Because the full download is large we suggest considering using tmux for session detachment.
+
 
 Useful options:
 
