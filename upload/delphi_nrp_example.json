@@ -54,7 +54,6 @@
             "energy_max": 0
         },
         "category": {
-            "id": "higgs"
         },
         "dataset_type": "simulated",
         "number_of_events": 0

@@ -5,3 +5,5 @@ pandas
 seaborn
 ipython
 numpy
+
+yarl
