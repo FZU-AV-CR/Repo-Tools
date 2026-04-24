@@ -38,7 +38,8 @@ from cernopendata_client.downloader import download_single_file, check_error
 from cernopendata_client.verifier import get_file_info_local, verify_file_info
 
 # --- Configuration ---
-SERVER_HTTP_URI = "https://opendata.cern.ch"
+# SERVER_HTTP_URI = "https://opendata.cern.ch"
+SERVER_HTTP_URI = "https://opendata-qa.cern.ch" # use QA instance based on email from Pablo Saiz
 DEFAULT_OUTPUT_DIR = Path("../..")
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_BASE = DEFAULT_OUTPUT_DIR
@@ -393,6 +394,7 @@ def parse_checksum_numeric(checksum_str):
 def compute_adler32_of_file(path):
     """
     Read file in streaming mode and compute adler32 numeric value (32-bit unsigned).
+    TODO: since the checksum is fixed we can switch back to the client
     """
     bufsize = 1 << 20
     a = 1  # initial adler32 value for zlib.adler32 when passing data incrementally
@@ -454,10 +456,7 @@ def download_worker(task):
 
     # fetch remote file info (size/checksum) using client helper:
     try:
-        # get_files_list requires the record_json; we will call get_record_as_json above and store per-task optionally.
-        # But we don't have it here, so get remote file info via get_file_info_remote helper where possible.
-        # The library function get_file_info_remote (used in CLI) takes (server, recid, protocol, filtered_files=None)
-        # We'll call it for the single file; it returns list of (filename, size, checksum)
+        # TODO: just pass the info from master cache
         remote_info_list = get_file_info_remote(SERVER_HTTP_URI, recid, protocol=protocol, filtered_files=[file_location])
         if remote_info_list:
             # remote_info_list likely returns dict keyed by names or list. Try both.
