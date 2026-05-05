@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 import zipfile
 from contextlib import asynccontextmanager
+import getpass
 
 from yarl import URL
 
@@ -194,14 +195,28 @@ def fill_cern_metadata(metadata, path) -> dict:
     return metadata
 
 
+async def create_prod_client():
+    config = Config()
+    token=""
+    # securely enter the token
+    if token == "":
+        token = getpass.getpass("Enter API token for repository: ").strip()
+
+    config.add_repository(RepositoryConfig(
+        alias="physica",
+        url=URL("https://invenio.fzu.cz/"),
+        token=token,
+        verify_tls=True
+    ))
+    return await get_async_client("physica", config=config)
+
+
 async def create_default_client():
     config = Config()
     token="jvU9QNA12lAqIImQ5UwLCRozOLxBeuyanM2sBKpYY1ijur0bNYTNsplc8N1s"
     # securely enter the token
     if token == "":
-        token = input("Enter API token for repository: ").strip()
-
-    # try for exceptions and print user-friendly message if connection fails
+        token = getpass.getpass("Enter API token for repository: ").strip()
 
     config.add_repository(RepositoryConfig(
         alias="physica",
@@ -217,7 +232,7 @@ async def create_test_client():
     config.add_repository(RepositoryConfig(
         alias="physica-local",
         url=URL("https://127.0.0.1:5000/"),
-        token="BEUlmR9j8FMnRVntAgKcGtHc4vQUgYj7WEJXcDobF6uqVj71zrbYMumjx7F9",
+        token="F4LexUH7dsuEvBW2kv0v55w5qFw3KIZRFDTfmPKqLCjYuw7LDTIJk8Rg7QbI",
         verify_tls=False
     ))
     return await get_async_client("physica-local", config=config)
@@ -338,7 +353,7 @@ async def upload_record_async(
 
         # Fill metadata template with actual values
         metadata = fill_cern_metadata(metadata, metadata_file)
-        print(json.dumps(metadata, indent=2))
+        # print(json.dumps(metadata, indent=2))
 
         # Create a new record
         record = await client.records.create(
@@ -391,9 +406,9 @@ async def upload_record_async(
             tasks = [asyncio.create_task(_upload_one_file(client, record, fp, sem, upload_limiter)) for fp in dataset_files]
             await asyncio.gather(*tasks)
 
-        published = await client.records.publish(record)
-        logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
-        return published
+        # published = await client.records.publish(record)
+        # logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
+        # return published
     except Exception as exc:
         status = "failed"
         error = str(exc)
@@ -477,8 +492,9 @@ async def ensure_zip_async(dataset_files: list[Path], zip_path: Path, zip_sem: a
 
 
 async def main_async() -> None:
-    client = await create_default_client()
+    # client = await create_default_client()
     # client = await create_test_client()
+    client = await create_prod_client()
 
     recid = 85104
     metadata_dir = Path("../metadata")

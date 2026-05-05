@@ -96,7 +96,8 @@ if lists_dir.exists():
         for rec in _iter_metadata_records(decoded):
             recid = _extract_recid_from_record(rec)
             if recid is not None and recid not in records_from_lists:
-                records_from_lists[recid] = rec
+                # if recid == 83931:
+                    records_from_lists[recid] = rec
 
 existing_recids = {int(r) for r in master_cache.keys()}
 new_recids = sorted(set(records_from_lists.keys()) - existing_recids)

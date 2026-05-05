@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import time
@@ -47,6 +48,32 @@ def _is_collision(metadata_path: Path) -> str:
     if secondary_str == "simulated":
         return "simulated"
     return "none"
+
+
+def _load_uploaded_recids(stats_path: Path) -> set[int]:
+    """Return recids with successful uploads from upload_stats.csv."""
+    # TODO: improve the logic to redo unfinished datasets
+    if not stats_path.exists():
+        return set()
+
+    uploaded: set[int] = set()
+    try:
+        with stats_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                status = str(row.get("status", "")).strip().lower()
+                recid_raw = row.get("recid")
+                if status != "ok" or recid_raw is None:
+                    continue
+                try:
+                    uploaded.add(int(recid_raw))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as exc:
+        logger.warning("Failed to parse stats file %s: %s", stats_path, exc)
+        return set()
+
+    return uploaded
 
 
 async def _upload_with_retries(client, recid, data_dir, metadata_dir, template_path, retries=3, delay=2, file_concurrency=4, upload_limiter=None, zip_sem=None, stats_path=None, stats_format="jsonl"):
@@ -118,6 +145,17 @@ async def main_async():
             missing.append(recid)
         else:
             none_type.append(recid)
+
+    # Resume logic to skip data already uploaded
+    already_uploaded = _load_uploaded_recids(stats_path)
+    if already_uploaded:
+        before = len(collision) + len(simulated) + len(none_type) + len(missing)
+        collision = [r for r in collision if r not in already_uploaded]
+        simulated = [r for r in simulated if r not in already_uploaded]
+        none_type = [r for r in none_type if r not in already_uploaded]
+        missing = [r for r in missing if r not in already_uploaded]
+        after = len(collision) + len(simulated) + len(none_type) + len(missing)
+        logger.info("Resume: skipped %s already uploaded recids from %s", before - after, stats_path)
 
     ordered = collision + simulated + none_type + missing
     logger.info(
