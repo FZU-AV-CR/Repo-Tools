@@ -454,68 +454,74 @@ def download_worker(task):
     target_path = recid_dir / filename
     attempt = 0
 
-    # fetch remote file info (size/checksum) using client helper:
-    try:
-        # TODO: just pass the info from master cache
-        remote_info_list = get_file_info_remote(SERVER_HTTP_URI, recid, protocol=protocol, filtered_files=[file_location])
-        if remote_info_list:
-            # remote_info_list likely returns dict keyed by names or list. Try both.
-            # standard expected format in CLI is a list of dicts or tuples; handle common cases:
-            if isinstance(remote_info_list, dict):
-                # sometimes returns dict keyed by filename
-                if filename in remote_info_list:
-                    remote_entry = remote_info_list[filename]
-                    remote_size = int(remote_entry.get("size", 0))
-                    remote_checksum = remote_entry.get("checksum")
-                else:
-                    # maybe the function returned mapping by location
-                    key = list(remote_info_list.keys())[0]
-                    remote_entry = remote_info_list[key]
-                    remote_size = int(remote_entry.get("size", 0))
-                    remote_checksum = remote_entry.get("checksum")
-            elif isinstance(remote_info_list, (list, tuple)) and remote_info_list:
-                # accept either a list of 3-tuples or list of dicts
-                elem = remote_info_list[0]
-                if isinstance(elem, (list, tuple)) and len(elem) >= 3:
-                    # (location, size, checksum)
-                    _, remote_size, remote_checksum = elem[0], int(elem[1]), elem[2]
-                elif isinstance(elem, dict):
-                    remote_size = int(elem.get("size", 0))
-                    remote_checksum = elem.get("checksum")
-                else:
-                    remote_size = None
-                    remote_checksum = None
-            else:
-                remote_size = None
-                remote_checksum = None
-        else:
-            remote_size = None
-            remote_checksum = None
-    except Exception:
-        logging.exception("Failed to get remote file info for recid %s file %s", recid, file_location)
-        remote_size = None
-        remote_checksum = None
-    except SystemExit as exc:
-        logging.error("Invalid recid %s for %s: %s", recid, file_location, exc)
-        return {
-            "recid": recid,
-            "file": str(target_path),
-            "bytes": None,
-            "start": None,
-            "end": None,
-            "duration_s": None,
-            "rate_Bps": None,
-            "success": False,
-            "error": "invalid recid",
-            "expected_size": None,
-            "expected_checksum": None,
-            "computed_checksum_numeric": None,
-            "checksum_ok": False,
-            "attempts": attempt,
-        }
+
+###  --- >> disabled below to test performance without client
+
+    # # fetch remote file info (size/checksum) using client helper:
+    # try:
+    #     # TODO: just pass the info from master cache
+    #     remote_info_list = get_file_info_remote(SERVER_HTTP_URI, recid, protocol=protocol, filtered_files=[file_location])
+    #     if remote_info_list:
+    #         # remote_info_list likely returns dict keyed by names or list. Try both.
+    #         # standard expected format in CLI is a list of dicts or tuples; handle common cases:
+    #         if isinstance(remote_info_list, dict):
+    #             # sometimes returns dict keyed by filename
+    #             if filename in remote_info_list:
+    #                 remote_entry = remote_info_list[filename]
+    #                 remote_size = int(remote_entry.get("size", 0))
+    #                 remote_checksum = remote_entry.get("checksum")
+    #             else:
+    #                 # maybe the function returned mapping by location
+    #                 key = list(remote_info_list.keys())[0]
+    #                 remote_entry = remote_info_list[key]
+    #                 remote_size = int(remote_entry.get("size", 0))
+    #                 remote_checksum = remote_entry.get("checksum")
+    #         elif isinstance(remote_info_list, (list, tuple)) and remote_info_list:
+    #             # accept either a list of 3-tuples or list of dicts
+    #             elem = remote_info_list[0]
+    #             if isinstance(elem, (list, tuple)) and len(elem) >= 3:
+    #                 # (location, size, checksum)
+    #                 _, remote_size, remote_checksum = elem[0], int(elem[1]), elem[2]
+    #             elif isinstance(elem, dict):
+    #                 remote_size = int(elem.get("size", 0))
+    #                 remote_checksum = elem.get("checksum")
+    #             else:
+    #                 remote_size = None
+    #                 remote_checksum = None
+    #         else:
+    #             remote_size = None
+    #             remote_checksum = None
+    #     else:
+    #         remote_size = None
+    #         remote_checksum = None
+    # except Exception:
+    #     logging.exception("Failed to get remote file info for recid %s file %s", recid, file_location)
+    #     remote_size = None
+    #     remote_checksum = None
+    # except SystemExit as exc:
+    #     logging.error("Invalid recid %s for %s: %s", recid, file_location, exc)
+    #     return {
+    #         "recid": recid,
+    #         "file": str(target_path),
+    #         "bytes": None,
+    #         "start": None,
+    #         "end": None,
+    #         "duration_s": None,
+    #         "rate_Bps": None,
+    #         "success": False,
+    #         "error": "invalid recid",
+    #         "expected_size": None,
+    #         "expected_checksum": None,
+    #         "computed_checksum_numeric": None,
+    #         "checksum_ok": False,
+    #         "attempts": attempt,
+    #     }
+
+###  --- << disabled above to test performance without client, following steps will be marked #X#
+
 
     # resume check
-    if already_downloaded(target_path, expected_size=remote_size, expected_checksum=remote_checksum):
+    if already_downloaded(target_path ): #X>#, expected_size=remote_size, expected_checksum=remote_checksum#<X#
         logging.info("SKIP (already downloaded) %s/%s", recid, filename)
         return {
             "recid": recid,
@@ -527,8 +533,10 @@ def download_worker(task):
             "rate_Bps": None,
             "success": True,
             "error": "SKIP (already downloaded)",
-            "expected_size": remote_size,
-            "expected_checksum": remote_checksum,
+            #X>#
+            # "expected_size": remote_size,
+            # "expected_checksum": remote_checksum,
+            #<X#
             "computed_checksum_numeric": None,
             "checksum_ok": True,
             "attempts": attempt,
@@ -574,57 +582,60 @@ def download_worker(task):
         except Exception:
             bytes_written = None
 
-        if remote_size:
-            if bytes_written != remote_size:
-                logging.warning("Size mismatch for %s/%s: expected %s, got %s", recid, filename, remote_size,
-                                bytes_written)
-                success = False
-                continue
-            else:
-                logging.info("Size match for %s/%s: %s bytes", recid, filename, bytes_written)
+    #X>#
+        # if remote_size:
+        #     if bytes_written != remote_size:
+        #         logging.warning("Size mismatch for %s/%s: expected %s, got %s", recid, filename, remote_size,
+        #                         bytes_written)
+        #         success = False
+        #         continue
+        #     else:
+        #         logging.info("Size match for %s/%s: %s bytes", recid, filename, bytes_written)
 
         # compute adler32 numeric if remote checksum is adler32
-        if remote_checksum:
-            alg, num, rawz = parse_checksum_numeric(remote_checksum)
-            if alg == "adler32" and num is not None:
-                try:
-                    computed_checksum_numeric = compute_adler32_of_file(target_path)
-                    checksum_ok = (computed_checksum_numeric == num)
-                    if not checksum_ok:
-                        logging.warning("Checksum mismatch for %s/%s: expected %08x, got %08x",
-                                        recid, filename, num, computed_checksum_numeric)
-                        success = False
-                        continue
-                    else:
-                        logging.info("Checksum match for %s/%s: %08x", recid, filename, computed_checksum_numeric)
-                except Exception:
-                    checksum_ok = False
-                    success = False
-                    continue
-            else:
-                # for non-adler algorithm, we don't compute here; attempt to use library verifier to compare if possible
-                computed_checksum_numeric = None
-                checksum_ok = None
+        # if remote_checksum:
+        #     alg, num, rawz = parse_checksum_numeric(remote_checksum)
+        #     if alg == "adler32" and num is not None:
+        #         try:
+        #             computed_checksum_numeric = compute_adler32_of_file(target_path)
+        #             checksum_ok = (computed_checksum_numeric == num)
+        #             if not checksum_ok:
+        #                 logging.warning("Checksum mismatch for %s/%s: expected %08x, got %08x",
+        #                                 recid, filename, num, computed_checksum_numeric)
+        #                 success = False
+        #                 continue
+        #             else:
+        #                 logging.info("Checksum match for %s/%s: %08x", recid, filename, computed_checksum_numeric)
+        #         except Exception:
+        #             checksum_ok = False
+        #             success = False
+        #             continue
+        #     else:
+        #         # for non-adler algorithm, we don't compute here; attempt to use library verifier to compare if possible
+        #         computed_checksum_numeric = None
+        #         checksum_ok = None
 
-                # also call verify_file_info if remote info available and file present (this uses verifier module)
-                if remote_checksum and alg != "adler32":
-                    try:
-                        # get local file info representation and remote info and run their verify routine (it may use formatting internally)
-                        file_info_local = get_file_info_local(recid_dir)
-                        file_info_remote = get_file_info_remote(SERVER_HTTP_URI, recid, protocol=protocol,
-                                                                filtered_files=[file_location])
-                        # verify_file_info will raise or log; wrap in try/except
-                        try:
-                            verify_file_info(file_info_local, file_info_remote)
-                        except Exception:
-                            # if verify_file_info throws due to formatting bug, we've already done numeric check above
-                            logging.debug("verify_file_info raised (non-fatal) for %s/%s", recid, filename)
-                            success = False
-                            continue
-                    except Exception:
-                        logging.debug("verify step failed (non-fatal) for %s/%s", recid, filename)
-                        success = False
-                        continue
+        #         # also call verify_file_info if remote info available and file present (this uses verifier module)
+        #         if remote_checksum and alg != "adler32":
+        #             try:
+        #                 # get local file info representation and remote info and run their verify routine (it may use formatting internally)
+        #                 file_info_local = get_file_info_local(recid_dir)
+        #                 file_info_remote = get_file_info_remote(SERVER_HTTP_URI, recid, protocol=protocol,
+        #                                                         filtered_files=[file_location])
+        #                 # verify_file_info will raise or log; wrap in try/except
+        #                 try:
+        #                     verify_file_info(file_info_local, file_info_remote)
+        #                 except Exception:
+        #                     # if verify_file_info throws due to formatting bug, we've already done numeric check above
+        #                     logging.debug("verify_file_info raised (non-fatal) for %s/%s", recid, filename)
+        #                     success = False
+        #                     continue
+        #             except Exception:
+        #                 logging.debug("verify step failed (non-fatal) for %s/%s", recid, filename)
+        #                 success = False
+        #                 continue
+
+    #<X#
 
     if not success:
         logging.exception("Giving up on %s/%s after %d attempts", recid, filename, attempt)
@@ -638,8 +649,10 @@ def download_worker(task):
             "rate_Bps": None,
             "success": False,
             "error": str(last_exception),
-            "expected_size": remote_size,
-            "expected_checksum": remote_checksum,
+    #X>#
+            # "expected_size": remote_size,
+            # "expected_checksum": remote_checksum,
+    #<X#
             "computed_checksum_numeric": None,
             "checksum_ok": False,
             "attempts": attempt,
@@ -658,8 +671,10 @@ def download_worker(task):
         "rate_Bps": rate_Bps,
         "success": True,
         "error": "",
-        "expected_size": remote_size,
-        "expected_checksum": remote_checksum,
+    #X>#
+        # "expected_size": remote_size,
+        # "expected_checksum": remote_checksum,
+    #<X#
         "computed_checksum_numeric": computed_checksum_numeric,
         "checksum_ok": checksum_ok,
         "attempts": attempt,
