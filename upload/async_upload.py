@@ -8,6 +8,7 @@ import zipfile
 from contextlib import asynccontextmanager
 import getpass
 
+# from _pytest._code import source
 from yarl import URL
 
 try:
@@ -77,15 +78,81 @@ def fill_cern_metadata(metadata, path) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         source = json.load(fh)
 
+    metadata = {
+    "metadata": {
+        "resource_type": {
+            "id": "dataset"
+        },
+        "recid": None,
+        "creators": [
+            {
+                "person_or_org": {
+                    "name": "DELPHI Collaboration",
+                    "type": "organizational"
+                }
+            }
+        ],
+        "file_types": [],
+        "title": "test",
+        "publication_date": None,
+        "publisher": "CERN Open Data Portal",
+        "description": "",
+        "subjects": [
+            {
+                "subject": "Higgs physics"
+            },
+            {
+                "subject": "Electron–positron collisions"
+            }
+        ],
+        "rights": [
+            {
+                "id": "cc0-1.0"
+            }
+        ],
+        "identifiers": [
+            {
+                "identifier": "",
+                "scheme": "url"
+            }
+        ],
+        "dates": [
+            {
+                "date": "",
+                "type": {
+                    "id": "created"
+                }
+            }
+        ],
+        "experiment": "DELPHI",
+        "collision_information": {
+            "type": "e+e-",
+            "energy": "",
+            "energy_min": 0,
+            "energy_max": 0
+        },
+        "category": {
+        },
+        "dataset_type": None,
+        "number_of_events": 0
+    },
+    "files": {
+        "enabled": True
+    }
+}
+
     src = source.get("metadata", {})
     tgt = metadata.get("metadata", {})
+
+    # print(json.dumps(src, indent=2))
 
     # Title / publisher / dates
     tgt["title"] = src.get("title", tgt.get("title", ""))
     # FZU
     tgt["publisher"] = "FZU Institute of Physics of the Czech Academy of Sciences"
     # Today
-    tgt["publication_date"] = time.strftime("%Y-%m-%d")
+    # tgt["publication_date"] = time.strftime("%Y-%m-%d")
+    tgt["publication_date"] = "2026-02-28"
 
     # Record ID
     recid = int(src.get("recid"))
@@ -141,11 +208,6 @@ def fill_cern_metadata(metadata, path) -> dict:
             return
         identifiers.append({"identifier": value, "scheme": scheme})
 
-    # _add_identifier(src.get("doi"), "doi")
-    # _add_identifier(((src.get("pids") or {}).get("oai") or {}).get("id"), "oai")
-    # if identifiers:
-    #     tgt["identifiers"] = identifiers
-
     # Dates (created)
     created_year = _to_year(_first(src.get("date_created", [])))
     if created_year and tgt.get("dates"):
@@ -155,6 +217,43 @@ def fill_cern_metadata(metadata, path) -> dict:
     exp = _first(src.get("experiment", [])) or collab
     if exp:
         tgt["experiment"] = exp
+
+    # Dataset type
+    secondary = (src.get("type") or {}).get("secondary", [])
+    if isinstance(secondary, list) and any(str(s).lower() == "simulated" for s in secondary):
+        tgt["dataset_type"] = "simulated"
+    elif isinstance(secondary, list) and any(str(s).lower() == "collision" for s in secondary):
+        tgt["dataset_type"] = "collision"
+    elif isinstance(secondary, list) and any(str(s).lower() == "logbook" for s in secondary):
+        tgt["dataset_type"] = "logbook"
+        tgt["resource_type"] = {"id": "publication"}
+        tgt.pop("collision_information", None)  # logbooks don't have collision info
+        tgt.pop("number_of_events", None)  # logbooks don't have experiment field
+        metadata["metadata"] = tgt
+        return metadata
+    elif isinstance(secondary, list) and any(str(s).lower() == "manual" for s in secondary):
+        tgt["dataset_type"] = "manual"
+        tgt["resource_type"] = {"id": "publication"}
+        tgt.pop("collision_information", None)  # logbooks don't have collision info
+        tgt.pop("number_of_events", None)  # logbooks don't have experiment field
+        metadata["metadata"] = tgt
+        return metadata
+    elif isinstance(secondary, list) and any(str(s).lower() == "report" for s in secondary):
+        tgt["dataset_type"] = "report"
+        tgt["resource_type"] = {"id": "publication"}
+        tgt.pop("collision_information", None)  # logbooks don't have collision info
+        tgt.pop("number_of_events", None)  # logbooks don't have experiment field
+        metadata["metadata"] = tgt
+        return metadata
+    else:
+        tgt["dataset_type"] = str(secondary[0]).lower()
+        if "dataset_type" in tgt and tgt["dataset_type"] not in ("Collision", "Simulated"):
+            print(f"Warning: dataset_type unknown. Got '{tgt['dataset_type']}'")
+
+    # _add_identifier(src.get("doi"), "doi")
+    # _add_identifier(((src.get("pids") or {}).get("oai") or {}).get("id"), "oai")
+    # if identifiers:
+    #     tgt["identifiers"] = identifiers
 
     # Collision information
     colinfo = src.get("collision_information", {})
@@ -175,16 +274,6 @@ def fill_cern_metadata(metadata, path) -> dict:
     # Category
     if primary:
         tgt["category"] = {"id": str(primary).lower()}
-
-    # Dataset type
-    secondary = (src.get("type") or {}).get("secondary", [])
-    if isinstance(secondary, list) and any(str(s).lower() == "simulated" for s in secondary):
-        tgt["dataset_type"] = "simulated"
-    elif isinstance(secondary, list) and any(str(s).lower() == "collision" for s in secondary):
-        tgt["dataset_type"] = "collision"
-    else:
-        if "dataset_type" in tgt and tgt["dataset_type"] not in ("Collision", "Simulated"):
-            print(f"Warning: dataset_type must be 'Collision' or 'Simulated'. Got '{tgt['dataset_type']}'")
 
     # Number of events
     num_events = (src.get("distribution") or {}).get("number_events")
@@ -211,9 +300,9 @@ async def create_prod_client():
     return await get_async_client("physica", config=config)
 
 
-async def create_default_client():
+async def create_test_client():
     config = Config()
-    token="jvU9QNA12lAqIImQ5UwLCRozOLxBeuyanM2sBKpYY1ijur0bNYTNsplc8N1s"
+    token="vB8oxTj9j7i42scO0WMFwvlwQ5w70xLUhAlkXQCRTasA2jQnqZLBSD56Om5U"
     # securely enter the token
     if token == "":
         token = getpass.getpass("Enter API token for repository: ").strip()
@@ -227,12 +316,12 @@ async def create_default_client():
     return await get_async_client("physica", config=config)
 
 
-async def create_test_client():
+async def create_local_client():
     config = Config()
     config.add_repository(RepositoryConfig(
         alias="physica-local",
         url=URL("https://127.0.0.1:5000/"),
-        token="F4LexUH7dsuEvBW2kv0v55w5qFw3KIZRFDTfmPKqLCjYuw7LDTIJk8Rg7QbI",
+        token="A9vVsdlTSuD0oBxMqNsT3mmtlGXZQp5lx85NLz2flpaH4cyy0Pp0scYyl0C2",
         verify_tls=False
     ))
     return await get_async_client("physica-local", config=config)
@@ -353,7 +442,7 @@ async def upload_record_async(
 
         # Fill metadata template with actual values
         metadata = fill_cern_metadata(metadata, metadata_file)
-        # print(json.dumps(metadata, indent=2))
+        print(json.dumps(metadata, indent=2))
 
         # Create a new record
         record = await client.records.create(
@@ -406,9 +495,9 @@ async def upload_record_async(
             tasks = [asyncio.create_task(_upload_one_file(client, record, fp, sem, upload_limiter)) for fp in dataset_files]
             await asyncio.gather(*tasks)
 
-        # published = await client.records.publish(record)
-        # logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
-        # return published
+        published = await client.records.publish(record)
+        logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
+        return published
     except Exception as exc:
         status = "failed"
         error = str(exc)
@@ -436,6 +525,7 @@ async def upload_record_async(
                 "file_count": len(dataset_files),
                 "zip_used": zip_used,
                 "bytes_uploaded": bytes_uploaded,
+                "url": str(record.links.self_html) if record else None,
             },
         )
 
@@ -492,11 +582,11 @@ async def ensure_zip_async(dataset_files: list[Path], zip_path: Path, zip_sem: a
 
 
 async def main_async() -> None:
-    # client = await create_default_client()
     # client = await create_test_client()
-    client = await create_prod_client()
+    client = await create_local_client()
+    # client = await create_prod_client()
 
-    recid = 85104
+    recid = 2
     metadata_dir = Path("../metadata")
     data_dir = Path("../data")
 
