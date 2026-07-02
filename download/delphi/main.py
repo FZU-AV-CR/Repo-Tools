@@ -689,7 +689,7 @@ def append_stats(csv_path, stats):
 
 
 def build_tasks_for_recid(recid, protocol=DOWNLOAD_PROTOCOL, download_engine=DOWNLOAD_ENGINE_DEFAULT,
-                          retry_limit=RETRY_LIMIT, retry_sleep=RETRY_SLEEP, expand=True):
+                          retry_limit=RETRY_LIMIT, retry_sleep=RETRY_SLEEP, expand=True, cached_metadata=None):
     """
     Uses library functions to get the record JSON and file locations, returns a list of task dicts.
     """
@@ -704,13 +704,16 @@ def build_tasks_for_recid(recid, protocol=DOWNLOAD_PROTOCOL, download_engine=DOW
             except Exception:
                 logging.warning("Failed to load cached metadata for recid %s, refetching.", recid)
                 record_json = None
-        if record_json is None:
-            logging.info("Fetching metadata for recid %s", recid)
-            record_json = get_record_as_json(SERVER_HTTP_URI, recid, None, None)
-            save_metadata(recid, record_json)
-        file_locations_info = get_files_list(SERVER_HTTP_URI, record_json, protocol, expand)
-        # get_files_list returns a list of tuples (location, size, checksum)
-        file_locations = [f[0] for f in file_locations_info]
+        if cached_metadata:
+            file_locations = cached_metadata["remote"]
+        else:
+            if record_json is None:
+                logging.info("Fetching metadata for recid %s", recid)
+                record_json = get_record_as_json(SERVER_HTTP_URI, recid, None, None)
+                save_metadata(recid, record_json)
+            file_locations_info = get_files_list(SERVER_HTTP_URI, record_json, protocol, expand)
+            # get_files_list returns a list of tuples (location, size, checksum)
+            file_locations = [f[0] for f in file_locations_info]
         tasks = []
         for fl in file_locations:
             tasks.append({
@@ -801,6 +804,9 @@ def main(args):
     # prepare CSV header
     write_stats_header_if_missing(STATS_CSV)
 
+    # load master cache again for file paths
+    cache_data = load_master_cache_data()
+
     # create a master task list
     master_tasks = []
     for recid in recids:
@@ -810,6 +816,7 @@ def main(args):
             download_engine=args.download_engine,
             retry_limit=args.retry_limit,
             retry_sleep=args.retry_sleep,
+            cached_metadata=cache_data[recid]
         )
         master_tasks.extend(tasks)
 
