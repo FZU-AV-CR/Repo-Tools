@@ -26,9 +26,15 @@ The project focuses on:
 
 - Python 3.11+
 - `nrp_cmd` async client for communication with NRP/Invenio, only works on Linux or WSL
+  - If you have problems with `nrp_cmd` installation because of aiohttp, try 
+```
+sudo apt update
+sudo apt install build-essential python3-dev
+```
 - `xrootd` client for downloading from CERN Open Data Portal
 - Access credentials/config for the target NRP/Invenio instance
 - requirements.txt for analysis and requirements_upload.txt for upload dependencies
+
 
 ## Typical Workflow
 
