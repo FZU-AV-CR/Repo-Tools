@@ -6,7 +6,7 @@ import logging
 import time
 from pathlib import Path
 
-from async_upload import create_default_client, upload_record_async, WeightedSemaphore, setup_logging
+from async_upload import create_test_client, upload_record_async, WeightedSemaphore, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +164,7 @@ async def main_async():
     )
     logger.info("Limits: max_concurrency=%s, upload_slots=50 (multipart=5), zip_tasks=2", max_concurrency)
 
-    client = await create_default_client()
+    client = await create_test_client()
     sem = asyncio.Semaphore(max_concurrency)
     start = time.perf_counter()
 
