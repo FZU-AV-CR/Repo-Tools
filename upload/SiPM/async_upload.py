@@ -58,7 +58,7 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Missing NRP async library: {exc}")
 
-import upload.ITk.adapters as adapters
+import adapters
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +83,6 @@ def configure_adapter(name: str | None = None):
     adapter = adapters.load(name)
     logger.info("Using adapter: %s", adapter.__name__)
     return adapter
-
-
-def _build_record_payload(metadata: dict[str, Any], schema_url: str) -> dict[str, Any]:
-    """Assemble the final record payload while preserving adapter metadata."""
-    record_payload = {
-        "metadata": metadata["metadata"],
-        "access": metadata["access"],
-        "files": metadata["files"],
-        "$schema": schema_url,
-    }
-    if metadata.get("communities"):
-        record_payload["communities"] = metadata["communities"]
-    return record_payload
 
 
 def _format_exception_details(exc: Exception) -> str:
@@ -363,12 +350,18 @@ async def upload_record_async(
             ),
         )
 
-        record_payload = _build_record_payload(metadata, record_schema_url)
-        logger.info(
-            "[%s] Creating record with payload: %s",
-            item.key,
-            json.dumps(record_payload, indent=2, ensure_ascii=False),
-        )
+        record_payload = {
+            "metadata": metadata["metadata"],
+            "access": metadata["access"],
+            "files": metadata["files"],
+            "$schema": record_schema_url,
+        }
+        # Only some adapters set "communities" (e.g. SiPM does, ITk
+        # doesn't) -- omit the key entirely rather than sending a null
+        # value when an adapter's build_invenio_metadata() doesn't
+        # include it.
+        if metadata.get("communities"):
+            record_payload["communities"] = metadata["communities"]
 
         record = await client.records.create(record_payload)
         logger.info("[%s] Created draft: %s", item.key, record.id)

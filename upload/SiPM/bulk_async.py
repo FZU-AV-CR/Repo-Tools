@@ -43,8 +43,8 @@ import signal
 import time
 from pathlib import Path
 
-import upload.ITk.adapters as adapters
-import upload.ITk.async_upload as async_upload
+import adapters
+import async_upload
 
 logger = logging.getLogger(__name__)
 

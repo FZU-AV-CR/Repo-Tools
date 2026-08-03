@@ -40,9 +40,12 @@ from pathlib import Path
 # for real runs)
 # ============================================================
 
-DEFAULT_METADATA_DIR = "/home/erutherford/Python WSL/ITk/Upload/Metadata"
-DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/ITk/Upload/Data to upload"
+DEFAULT_METADATA_DIR = "/home/[XXX]/Python WSL/ITk/Upload/Metadata"
+DEFAULT_DATA_ROOT = "/home/[XXX]/Python WSL/ITk/Upload/Data to upload"
 DEFAULT_README_FILE = None  # README is optional -- pass --readme-file to include one
+
+# Must match this adapter's key in adapters.ADAPTERS.
+ADAPTER_NAME = "itk"
 
 # Confirmed for local only so far; verify before using with test1/production
 # (same caveat as FRAM's DEFAULT_SCHEMA_URL).
@@ -55,19 +58,20 @@ DEFAULT_SCHEMA_URL = "local://atlas_itk-v1.0.0.json"
 CREATORS = [
     {
         "person_or_org": {
-            "type": "personal",
-            "name": "Federičová, Pavla",
-            "given_name": "Pavla",
-            "family_name": "Federičová",
-            "identifiers": [{"scheme": "orcid", "identifier": "0000-0002-8240-904X"}],
-        }
-    },
-    {
-        "person_or_org": {
             "name": "FZU Institute of Physics of the Czech Academy of Sciences",
             "type": "organizational",
         }
     },
+]
+
+CONTRIBUTORS = [
+    {
+        "person_or_org": {
+            "name": "ATLAS-ITk",
+            "type": "organizational",
+        },
+        "role": {"id": "ResearchGroup"},
+    }
 ]
 
 SUBJECTS = [
@@ -238,6 +242,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
         "metadata": {
             "resource_type": {"id": "c_ddb1"},
             "creators": CREATORS,
+            "contributors": CONTRIBUTORS,
             "file_types": ["dat"],
             "title": title,
             "files": extracted["files"],
@@ -322,6 +327,7 @@ ENGINE_DIR = Path(__file__).resolve().parent.parent
 
 def _run_via_bulk_async() -> None:
     import importlib
+    import os
     import sys
 
     # async_upload.py / bulk_async.py aren't in this file's own directory,
@@ -340,7 +346,14 @@ def _run_via_bulk_async() -> None:
     # those tools.
     bulk_async = importlib.import_module("bulk_async")
 
+    # Fallback for any code path that reads the env var instead of the CLI
+    # flag (e.g. a direct async_upload.main_async() smoke test); the
+    # --adapter flag injected below takes precedence for bulk_async.py
+    # itself since it's an explicit CLI arg.
+    os.environ.setdefault("PHYSICS_ADAPTER", ADAPTER_NAME)
+
     default_flags = {
+        "--adapter": ADAPTER_NAME,
         "--metadata-dir": DEFAULT_METADATA_DIR,
         "--data-root": DEFAULT_DATA_ROOT,
     }
