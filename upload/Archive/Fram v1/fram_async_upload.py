@@ -73,7 +73,7 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Missing NRP async library: {exc}")
 
-from calibrate import crop_overscans
+from upload.Archive.Fram.calibrate import crop_overscans
 
 warnings.simplefilter("ignore", FITSFixedWarning)
 

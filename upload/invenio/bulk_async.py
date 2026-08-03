@@ -1,24 +1,36 @@
 """
-Bulk async orchestrator for FRAM FITS uploads.
+Generic bulk async orchestrator for Physics-repository uploads.
 
-Mirrors the shape of the DELPHI template (bulk_async.py): discovers work
-items, applies resume logic against an existing stats file, then runs
-uploads concurrently under a bounded semaphore.
+This is the shared engine, not a standalone script -- it's driven by a
+model-specific entry point (itk_upload.py, sipm_upload.py, fram_upload.py,
+delphi_upload.py, ...), which fills in that model's default paths and
+calls bulk_async.main(). Running this file directly
+(`python3 bulk_async.py`) raises an error pointing to the correct entry
+point instead.
 
-Differences from the DELPHI case:
-  - Work items are FITS files discovered by recursively walking an input
-    directory (one record per file; no recid exists before upload).
-  - Resume/dedup key is the file's path relative to the input root (e.g.
-    "auger2/20260408105436-044-RA.fits"), not an integer recid.
-  - No zip / per-record-folder logic; every file is independent.
-  - Adds: environment selection (local/test1/production) with a production
-    confirmation guard, a circuit breaker that stops starting new uploads
-    after too many consecutive failures, graceful shutdown on SIGINT/
-    SIGTERM, periodic progress logging, a --dry-run mode (which skips
-    repository client setup entirely -- no network/token needed), and a
-    startup warning listing any files "interrupted" by a previous crashed
-    run (see fram_async_upload.upload_fits_async's docstring for what that
-    means and its limits).
+Mirrors fram_bulk_async.py (the original, model-specific FRAM script this
+was generalized from) as closely as possible: resume via a stats CSV,
+bounded concurrency, a circuit breaker, graceful shutdown on SIGINT/SIGTERM,
+periodic progress logging, and a --dry-run mode that skips repository
+client setup entirely (no network/token needed).
+
+Differences from fram_bulk_async.py:
+  - Work items are discovered by <adapter>.discover_items(), which for the
+    current TXT/ZIP-based adapters (ITk, SiPM) takes --metadata-dir/
+    --data-root instead of a single --input-dir. A future FRAM adapter
+    doing a recursive filesystem walk for FITS files is free to interpret
+    those same two flags however makes sense for it (e.g. --data-root as
+    the FITS tree root and --metadata-dir unused).
+  - Everything else (resume/dedup keyed off "key" in the stats CSV, circuit
+    breaker, progress tracker, retry wrapper, shutdown handling) is
+    unchanged in shape from fram_bulk_async.py.
+
+The adapter itself is no longer hardcoded here -- it's resolved at
+runtime by adapters.py, from --adapter (this file's own CLI flag) or the
+PHYSICS_ADAPTER environment variable. Each model's entry-point script sets
+one of these for you, so `python3 sipm_upload.py ...` and
+`python3 itk_upload.py ...` both work without editing this file. To add a
+new metadata model, see adapters.py -- no changes needed here.
 """
 
 from __future__ import annotations
@@ -27,49 +39,22 @@ import argparse
 import asyncio
 import csv
 import logging
-import os
 import signal
 import time
 from pathlib import Path
 
-import fram_async_upload
+import adapters
+import async_upload
 
 logger = logging.getLogger(__name__)
 
-FITS_EXTENSIONS = (".fits", ".fit", ".fts")
 TERMINAL_STATUSES = {"ok", "failed", "skipped_invalid", "dryrun"}
 
 
 # ============================================================
-# DISCOVERY
-# ============================================================
-
-
-def _discover_fits_files(root: Path, sort: bool = True) -> list[Path]:
-    """Recursively walk root, returning all FITS files found."""
-    files: list[Path] = []
-    log_every = 50_000
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
-            if os.path.splitext(name)[1].lower() in FITS_EXTENSIONS:
-                files.append(Path(dirpath) / name)
-                if len(files) % log_every == 0:
-                    logger.info("Discovery in progress: %s FITS files found so far...", len(files))
-    if sort:
-        files.sort()
-    return files
-
-
-def _relative_key(fits_path: Path, root: Path) -> str:
-    """Return the file path relative to the upload root, or after 'Data to upload'."""
-    if "Data to upload" in fits_path.parts:
-        idx = fits_path.parts.index("Data to upload")
-        return Path(*fits_path.parts[idx + 1:]).as_posix()
-    return fits_path.relative_to(root).as_posix()
-
-
-# ============================================================
 # RESUME / INTERRUPTED-RUN DETECTION
+# (same logic as fram_bulk_async.py's _scan_stats -- generic since it's
+# already keyed off the "key" column, not anything FITS-specific)
 # ============================================================
 
 
@@ -116,7 +101,7 @@ def _scan_stats(stats_path: Path) -> tuple[set[str], set[str]]:
 
 
 # ============================================================
-# CIRCUIT BREAKER
+# CIRCUIT BREAKER  (unchanged from fram_bulk_async.py)
 # ============================================================
 
 
@@ -145,7 +130,7 @@ class CircuitBreaker:
 
 
 # ============================================================
-# PROGRESS TRACKING
+# PROGRESS TRACKING  (unchanged from fram_bulk_async.py)
 # ============================================================
 
 
@@ -185,14 +170,14 @@ class ProgressTracker:
             remaining = self.total - self.done
             eta_s = remaining / rate if rate > 0 else float("inf")
             logger.info(
-                "Progress: %s/%s done (ok=%s failed=%s skipped=%s) | %.2f files/s | ETA %s",
+                "Progress: %s/%s done (ok=%s failed=%s skipped=%s) | %.2f items/s | ETA %s",
                 self.done, self.total, self.ok, self.failed, self.skipped, rate, _format_eta(eta_s),
             )
             self._last_log = now
 
 
 # ============================================================
-# GRACEFUL SHUTDOWN
+# GRACEFUL SHUTDOWN  (unchanged from fram_bulk_async.py)
 # ============================================================
 
 
@@ -208,14 +193,13 @@ def _request_shutdown(stop_event: asyncio.Event, sig) -> None:
 
 
 # ============================================================
-# PER-FILE RETRY WRAPPER
+# PER-ITEM RETRY WRAPPER  (unchanged shape from fram_bulk_async.py)
 # ============================================================
 
 
 async def _upload_with_retries(
     client,
-    fits_path: Path,
-    relative_key: str,
+    item,
     stats_path: Path,
     stats_format: str,
     schema_url: str,
@@ -229,13 +213,12 @@ async def _upload_with_retries(
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         if stop_event.is_set():
-            logger.info("[%s] Shutdown requested, aborting before attempt %s", relative_key, attempt)
+            logger.info("[%s] Shutdown requested, aborting before attempt %s", item.key, attempt)
             return None
         try:
-            return await fram_async_upload.upload_fits_async(
+            return await async_upload.upload_record_async(
                 client=client,
-                fits_path=fits_path,
-                relative_key=relative_key,
+                item=item,
                 stats_path=stats_path,
                 stats_format=stats_format,
                 dry_run=dry_run,
@@ -244,7 +227,7 @@ async def _upload_with_retries(
             )
         except Exception as exc:
             last_exc = exc
-            logger.warning("[%s] Upload failed (attempt %s/%s): %s", relative_key, attempt, retries, exc)
+            logger.warning("[%s] Upload failed (attempt %s/%s): %s", item.key, attempt, retries, exc)
             if attempt == retries:
                 raise
             await asyncio.sleep(delay * attempt)
@@ -257,30 +240,42 @@ async def _upload_with_retries(
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    fram_async_upload.setup_logging(log_file=Path(args.log_file) if args.log_file else None)
+    async_upload.setup_logging(log_file=Path(args.log_file) if args.log_file else None)
+
+    # Resolve + configure the metadata-model adapter (--adapter flag ->
+    # PHYSICS_ADAPTER env var -> error). async_upload.configure_adapter()
+    # sets its own module-level `adapter` global (used by
+    # upload_record_async()) and returns the same module here for local use.
+    adapter = async_upload.configure_adapter(args.adapter)
+    schema_url = args.schema_url or adapter.DEFAULT_SCHEMA_URL
 
     if args.token:
         logger.warning(
             "Using --token from the command line; prefer the %s environment "
             "variable to avoid leaking credentials via process listings or "
             "shell history.",
-            fram_async_upload.TOKEN_ENV_VAR,
+            async_upload.TOKEN_ENV_VAR,
         )
 
-    input_dir = Path(args.input_dir)
+    metadata_dir = Path(args.metadata_dir)
+    data_root = Path(args.data_root)
+    readme_file = Path(args.readme_file) if args.readme_file else None
     stats_path = Path(args.stats_path)
 
-    if not input_dir.exists():
-        logger.error("Input directory does not exist: %s", input_dir)
+    if not metadata_dir.exists():
+        logger.error("Metadata directory does not exist: %s", metadata_dir)
+        return
+    if not data_root.exists():
+        logger.error("Data directory does not exist: %s", data_root)
         return
 
     # Preflight: validate we can build a client / have a token *before*
-    # doing any (potentially very slow) directory discovery. Skipped
-    # entirely for --dry-run, which never touches the repository.
+    # doing any directory discovery. Skipped entirely for --dry-run, which
+    # never touches the repository.
     client = None
     if not args.dry_run:
         try:
-            client = await fram_async_upload.create_client_for_environment(
+            client = await async_upload.create_client_for_environment(
                 args.environment, token=args.token, confirm_production=not args.yes,
             )
         except Exception as exc:
@@ -289,24 +284,22 @@ async def main_async(args: argparse.Namespace) -> None:
     else:
         logger.info("Dry-run mode: no records will be created, uploaded, or published. Skipping repository client setup.")
 
-    all_files = _discover_fits_files(input_dir, sort=not args.no_sort)
-    logger.info("FITS files found under %s: %s", input_dir, len(all_files))
-    if not all_files:
+    items = adapter.discover_items(metadata_dir=metadata_dir, data_root=data_root, readme_file=readme_file)
+    logger.info("Work items found under %s: %s", metadata_dir, len(items))
+    if not items:
         logger.info("Nothing to do.")
         return
 
-    keyed = [(f, _relative_key(f, input_dir)) for f in all_files]
-
     uploaded_keys, interrupted_keys = _scan_stats(stats_path)
     if uploaded_keys:
-        before = len(keyed)
-        keyed = [(f, k) for f, k in keyed if k not in uploaded_keys]
-        logger.info("Resume: skipped %s already uploaded files from %s", before - len(keyed), stats_path)
+        before = len(items)
+        items = [it for it in items if it.key not in uploaded_keys]
+        logger.info("Resume: skipped %s already uploaded items from %s", before - len(items), stats_path)
 
     if interrupted_keys:
         sample = ", ".join(list(interrupted_keys)[:20])
         logger.warning(
-            "%s file(s) have a 'started' stats row from a previous run with no "
+            "%s item(s) have a 'started' stats row from a previous run with no "
             "terminal status -- these may have created orphaned draft records "
             "in the repository if that run crashed mid-upload. They will be "
             "re-attempted now; check the repository for duplicates if this is "
@@ -315,13 +308,13 @@ async def main_async(args: argparse.Namespace) -> None:
         )
 
     logger.info(
-        "Files to upload: %s (environment=%s, max_concurrency=%s, dry_run=%s)",
-        len(keyed), args.environment, args.max_concurrency, args.dry_run,
+        "Items to upload: %s (adapter=%s, environment=%s, max_concurrency=%s, dry_run=%s)",
+        len(items), adapter.__name__, args.environment, args.max_concurrency, args.dry_run,
     )
 
     sem = asyncio.Semaphore(args.max_concurrency)
     breaker = CircuitBreaker(args.max_consecutive_failures)
-    progress = ProgressTracker(total=len(keyed), interval=args.progress_interval)
+    progress = ProgressTracker(total=len(items), interval=args.progress_interval)
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -334,20 +327,19 @@ async def main_async(args: argparse.Namespace) -> None:
 
     start = time.perf_counter()
 
-    async def _run_one(fits_path: Path, relative_key: str):
+    async def _run_one(item):
         async with sem:
             if stop_event.is_set() or breaker.tripped:
-                logger.info("[%s] Skipping (shutdown requested or circuit breaker tripped)", relative_key)
+                logger.info("[%s] Skipping (shutdown requested or circuit breaker tripped)", item.key)
                 progress.record("skipped")
                 return None
             try:
                 result = await _upload_with_retries(
                     client=client,
-                    fits_path=fits_path,
-                    relative_key=relative_key,
+                    item=item,
                     stats_path=stats_path,
                     stats_format="csv",
-                    schema_url=args.schema_url,
+                    schema_url=schema_url,
                     dry_run=args.dry_run,
                     validate=not args.no_validate,
                     stop_event=stop_event,
@@ -362,7 +354,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 progress.record("failed")
                 return exc
 
-    tasks = [asyncio.create_task(_run_one(f, k)) for f, k in keyed]
+    tasks = [asyncio.create_task(_run_one(it)) for it in items]
     await asyncio.gather(*tasks, return_exceptions=True)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -372,7 +364,7 @@ async def main_async(args: argparse.Namespace) -> None:
             pass
 
     logger.info(
-        "%s finished in %.2fs. total=%s ok=%s failed=%s skipped=%s (see %s for full per-file status)",
+        "%s finished in %.2fs. total=%s ok=%s failed=%s skipped=%s (see %s for full per-item status)",
         "Dry run" if args.dry_run else "Bulk upload",
         time.perf_counter() - start,
         progress.done, progress.ok, progress.failed, progress.skipped,
@@ -381,8 +373,22 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Bulk async upload of FRAM FITS files from a directory.")
-    parser.add_argument("--input-dir", required=True, help="Root directory to recursively scan for FITS files")
+    parser = argparse.ArgumentParser(
+        description="Bulk async upload of Physics-repository records from TXT metadata files + matching data files. "
+                     "The metadata model is selected via --adapter (or the PHYSICS_ADAPTER env var)."
+    )
+    parser.add_argument(
+        "--adapter", choices=adapters.available(), default=None,
+        help=f"Which metadata-model adapter to use. Falls back to the {adapters.ENV_VAR} "
+             "environment variable if omitted (each model's own entry-point script, e.g. "
+             "sipm_upload.py, sets this for you).",
+    )
+    parser.add_argument("--metadata-dir", required=True, help="Directory containing the *.txt metadata files (one per record)")
+    parser.add_argument("--data-root", required=True, help="Directory containing the matching data files (ZIPs, or a per-record folder of ZIPs, depending on the adapter)")
+    parser.add_argument(
+        "--readme-file", default=None,
+        help="Optional shared README.txt uploaded alongside every record's data. Omit to upload without a README.",
+    )
     parser.add_argument(
         "--stats-path",
         default="upload_stats.csv",
@@ -390,26 +396,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-concurrency", type=int, default=4, help="Maximum concurrent uploads")
     parser.add_argument(
-        "--environment", choices=sorted(fram_async_upload.ENVIRONMENTS), default="local",
+        "--environment", choices=sorted(async_upload.ENVIRONMENTS), default="local",
         help="Which repository to upload to (local / test1 / production)",
     )
     parser.add_argument(
-        "--schema-url", default=fram_async_upload.DEFAULT_SCHEMA_URL,
-        help="Invenio $schema value; confirmed only for local so far -- verify before using with test1/production",
+        "--schema-url", default=None,
+        help="Invenio $schema value; defaults to the selected adapter's own DEFAULT_SCHEMA_URL if omitted. "
+             "Confirmed only for local so far -- verify before using with test1/production.",
     )
     parser.add_argument(
         "--token", default=None,
-        help=f"API token; prefer the {fram_async_upload.TOKEN_ENV_VAR} environment variable over this flag",
+        help=f"API token; prefer the {async_upload.TOKEN_ENV_VAR} environment variable over this flag",
     )
     parser.add_argument(
         "--yes", action="store_true",
         help="Skip the interactive confirmation prompt required for --environment production",
     )
     parser.add_argument("--dry-run", action="store_true", help="Extract & validate metadata but do not create/upload/publish any records")
-    parser.add_argument("--no-sort", action="store_true", help="Skip sorting the discovered file list (faster discovery on very large trees)")
     parser.add_argument("--no-validate", action="store_true", help="Disable the minimal required-field check before upload")
     parser.add_argument("--max-consecutive-failures", type=int, default=15, help="Stop starting new uploads after this many consecutive failures")
-    parser.add_argument("--max-retries", type=int, default=3, help="Retry attempts per file")
+    parser.add_argument("--max-retries", type=int, default=3, help="Retry attempts per item")
     parser.add_argument("--retry-delay", type=int, default=2, help="Base delay (seconds) between retries; scales with attempt number")
     parser.add_argument("--log-file", default=None, help="Optional rotating log file path, in addition to console output")
     parser.add_argument("--progress-interval", type=float, default=30.0, help="Seconds between progress log lines")
@@ -422,26 +428,29 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "bulk_async.py is not meant to be run directly -- it's the shared "
+        "engine, driven by a model-specific entry point. Run one of:\n"
+        "    python3 itk_upload.py [flags]\n"
+        "    python3 sipm_upload.py [flags]\n"
+        "    python3 fram_upload.py [flags]\n"
+        "    python3 delphi_upload.py [flags]\n"
+        "(each imports this module and calls bulk_async.main() after filling "
+        "in that model's default paths and --adapter name.)"
+    )
 
 
-### cd upload/Fram
-
-
-### dry-run test against test1, no repository client touched at all locally
-# python3 fram_bulk_async.py \
-#   --input-dir "<your dir>" \
-#   --stats-path "upload_stats.csv" \
-#   --environment test1 \
-#   --dry-run
-
-### production run (prompts for typed "PRODUCTION" confirmation unless --yes is passed):
-# python3 fram_bulk_async.py \
-#   --input-dir "<your dir>" \
-#   --stats-path "upload_stats.csv" \
-#   --environment production \
-#   --max-concurrency 4
-
-
+### bulk_async.py is not run directly -- see itk_upload.py / sipm_upload.py
+### / fram_upload.py / delphi_upload.py for the actual entry points and
+### their usage examples (each calls bulk_async.main() after filling in
+### that model's default paths).
+#
+# python3 sipm_upload.py --environment test1 --dry-run
+# python3 sipm_upload.py --environment local
+# python3 itk_upload.py --environment production --max-concurrency 4
+#
+# Or drive bulk_async.py's CLI directly with an explicit --adapter:
+# python3 -c "import bulk_async; bulk_async.main()" \
+#     --adapter sipm --metadata-dir ... --data-root ... --environment local
 
 ###
