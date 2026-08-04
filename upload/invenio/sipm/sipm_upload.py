@@ -60,9 +60,9 @@ from pathlib import Path
 # for real runs)
 # ============================================================
 
-DEFAULT_METADATA_DIR = "/home/erutherford/Python WSL/SiPM/Upload/Metadata"
-DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/SiPM/Upload/Data to upload"
-DEFAULT_README_FILE = "/home/erutherford/Python WSL/SiPM/Upload/README.txt"
+DEFAULT_METADATA_DIR = "/home/[XX]/Python WSL/SiPM/Upload/Metadata"
+DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/SiPM/Upload/Data to upload"
+DEFAULT_README_FILE = "/home/[XX]/Python WSL/SiPM/Upload/README.txt"
 
 # Must match this adapter's key in adapters.ADAPTERS.
 ADAPTER_NAME = "sipm"

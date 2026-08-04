@@ -40,8 +40,8 @@ from pathlib import Path
 # for real runs)
 # ============================================================
 
-DEFAULT_METADATA_DIR = "/home/erutherford/Python WSL/ITk/Upload/Metadata"
-DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/ITk/Upload/Data to upload"
+DEFAULT_METADATA_DIR = "/home/[XX]/Python WSL/ITk/Upload/Metadata"
+DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/ITk/Upload/Data to upload"
 DEFAULT_README_FILE = None  # README is optional -- pass --readme-file to include one
 
 # Must match this adapter's key in adapters.ADAPTERS.

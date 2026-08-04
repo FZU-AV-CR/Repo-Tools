@@ -95,7 +95,7 @@ warnings.simplefilter("ignore", FITSFixedWarning)
 # as DEFAULT_DATA_ROOT so bulk_async.py's "does metadata_dir exist?"
 # preflight check passes trivially. discover_items() below ignores its
 # metadata_dir argument entirely.
-DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/FRAM/Upload/Data to upload"
+DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/FRAM/Upload/Data to upload"
 DEFAULT_METADATA_DIR = DEFAULT_DATA_ROOT
 DEFAULT_README_FILE = None  # no shared README wired up yet for FRAM (open item)
 
