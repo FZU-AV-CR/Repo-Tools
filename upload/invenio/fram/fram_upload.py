@@ -592,6 +592,6 @@ if __name__ == "__main__":
     _run_via_bulk_async()
 
 
-#   cd FRAM/Scripts/upload/FRAM
-#   python3 fram_upload.py --environment test1 --dry-run
+#   cd upload/invenio/fram
+#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/FRAM/Upload/Data to upload/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4

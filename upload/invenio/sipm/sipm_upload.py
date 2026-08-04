@@ -413,5 +413,5 @@ if __name__ == "__main__":
     _run_via_bulk_async()
 
 
-#   cd SiPM/Scripts/upload/SiPM
+#   cd upload/invenio/sipm
 #   python3 sipm_upload.py --enviornment test1

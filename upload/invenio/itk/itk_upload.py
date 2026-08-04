@@ -372,5 +372,5 @@ if __name__ == "__main__":
     _run_via_bulk_async()
 
 
-#   cd ITk/Scripts/upload/ITk
+#   cd upload/invenio/itk
 #   python3 itk_upload.py
