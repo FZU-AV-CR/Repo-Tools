@@ -25,7 +25,79 @@ except Exception as exc:
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.WARNING)
 
-def fill_cern_metadata(metadata, path) -> dict:
+
+def serialize_metadata(metadata) -> dict:
+    def _scalar(value):
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    def _item_key(value):
+        if isinstance(value, dict):
+            parts = []
+            for key in sorted(value.keys(), key=str):
+                if key == "id":
+                    continue
+                rendered = _item_key(value[key])
+                if rendered != "":
+                    parts.append(f"{key}={rendered}")
+            return "|".join(parts).lower()
+        if isinstance(value, list):
+            parts = sorted(
+                (rendered for rendered in (_item_key(item) for item in value) if rendered != ""),
+                key=str.lower,
+            )
+            return "|".join(parts).lower()
+        return _scalar(value).lower()
+
+    def _single_field_value(value):
+        if isinstance(value, dict):
+            keys = [key for key in sorted(value.keys(), key=str) if key != "id"]
+            if len(keys) == 1 and not isinstance(value[keys[0]], (dict, list)):
+                return _scalar(value[keys[0]])
+        return None
+
+    def _flatten(value, prefix="", out=None):
+        if out is None:
+            out = {}
+
+        if isinstance(value, dict):
+            for key in sorted(value.keys(), key=str):
+                if key == "id":
+                    continue
+                next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                item = value[key]
+                if isinstance(item, dict):
+                    _flatten(item, next_prefix, out)
+                elif isinstance(item, list):
+                    sorted_items = sorted(item, key=_item_key)
+                    for index, element in enumerate(sorted_items):
+                        collapsed = _single_field_value(element)
+                        if collapsed is not None:
+                            out[f"{next_prefix}.{index}"] = collapsed
+                        else:
+                            _flatten(element, f"{next_prefix}.{index}", out)
+                else:
+                    out[next_prefix] = _scalar(item)
+            return out
+
+        if isinstance(value, list):
+            sorted_items = sorted(value, key=_item_key)
+            for index, element in enumerate(sorted_items):
+                _flatten(element, f"{prefix}.{index}" if prefix else str(index), out)
+            return out
+
+        if prefix:
+            out[prefix] = _scalar(value)
+        return out
+
+    root = metadata.get("metadata") if isinstance(metadata, dict) and "metadata" in metadata else metadata
+    return _flatten(root if root is not None else {})
+
+
+def fill_cern_metadata(source) -> dict:
     def _first(seq, default=None):
         return seq[0] if isinstance(seq, list) and seq else default
 
@@ -75,13 +147,13 @@ def fill_cern_metadata(metadata, path) -> dict:
         except ValueError:
             return None
 
-    with open(path, "r", encoding="utf-8") as fh:
-        source = json.load(fh)
+    # with open(path, "r", encoding="utf-8") as fh:
+    #     source = json.load(fh)
 
     metadata = {
     "metadata": {
         "resource_type": {
-            "id": "dataset"
+            "id": "c_ddb1"
         },
         "recid": None,
         "creators": [
@@ -107,7 +179,7 @@ def fill_cern_metadata(metadata, path) -> dict:
         ],
         "rights": [
             {
-                "id": "cc0-1.0"
+                "id": "CC0-1.0"
             }
         ],
         "identifiers": [
@@ -120,11 +192,13 @@ def fill_cern_metadata(metadata, path) -> dict:
             {
                 "date": "",
                 "type": {
-                    "id": "created"
+                    "id": "Created"
                 }
             }
         ],
-        "experiment": "DELPHI",
+        "experiment": {
+        "id": "DELPHI"
+        },
         "collision_information": {
             "type": "e+e-",
             "energy": "",
@@ -151,8 +225,8 @@ def fill_cern_metadata(metadata, path) -> dict:
     # FZU
     tgt["publisher"] = "FZU Institute of Physics of the Czech Academy of Sciences"
     # Today
-    # tgt["publication_date"] = time.strftime("%Y-%m-%d")
-    tgt["publication_date"] = "2026-02-28"
+    tgt["publication_date"] = time.strftime("%Y-%m-%d")
+    # tgt["publication_date"] = "2026-02-28"
 
     # Record ID
     recid = int(src.get("recid"))
@@ -188,7 +262,12 @@ def fill_cern_metadata(metadata, path) -> dict:
     if primary:
         subjects.append({"subject": str(primary)})
     for item in src.get("collections", []):
-        subjects.append({"subject": str(item)})
+        # separate by -
+        if "-" in str(item):
+            for subitem in str(item).split("-"):
+                subjects.append({"subject": subitem.strip()})
+        else:
+            subjects.append({"subject": str(item)})
     if subjects:
         tgt["subjects"] = subjects
 
@@ -197,7 +276,7 @@ def fill_cern_metadata(metadata, path) -> dict:
     if isinstance(license_info, dict):
         attr = str(license_info.get("attribution", "")).lower()
         if "cc0-1.0" in attr:
-            tgt["rights"] = [{"id": "cc0-1.0"}]
+            tgt["rights"] = [{"id": "CC0-1.0"}]
 
     # Identifiers (append DOI/OAI if present)
     identifiers = tgt.get("identifiers", [])
@@ -216,7 +295,7 @@ def fill_cern_metadata(metadata, path) -> dict:
     # Experiment
     exp = _first(src.get("experiment", [])) or collab
     if exp:
-        tgt["experiment"] = exp
+        tgt["experiment"] = {"id": exp}
 
     # Dataset type
     secondary = (src.get("type") or {}).get("secondary", [])
@@ -225,22 +304,30 @@ def fill_cern_metadata(metadata, path) -> dict:
     elif isinstance(secondary, list) and any(str(s).lower() == "collision" for s in secondary):
         tgt["dataset_type"] = "collision"
     elif isinstance(secondary, list) and any(str(s).lower() == "logbook" for s in secondary):
+        # TODO: fix values
         tgt["dataset_type"] = "logbook"
-        tgt["resource_type"] = {"id": "publication"}
+        tgt["resource_type"] = {"id": "H41Y-FW7B"}  # logbook
         tgt.pop("collision_information", None)  # logbooks don't have collision info
         tgt.pop("number_of_events", None)  # logbooks don't have experiment field
         metadata["metadata"] = tgt
         return metadata
     elif isinstance(secondary, list) and any(str(s).lower() == "manual" for s in secondary):
         tgt["dataset_type"] = "manual"
-        tgt["resource_type"] = {"id": "publication"}
+        tgt["resource_type"] = {"id": "c_71bd"} # manual
         tgt.pop("collision_information", None)  # logbooks don't have collision info
         tgt.pop("number_of_events", None)  # logbooks don't have experiment field
         metadata["metadata"] = tgt
         return metadata
     elif isinstance(secondary, list) and any(str(s).lower() == "report" for s in secondary):
         tgt["dataset_type"] = "report"
-        tgt["resource_type"] = {"id": "publication"}
+        tgt["resource_type"] = {"id": "c_93fc"} # report
+        tgt.pop("collision_information", None)  # logbooks don't have collision info
+        tgt.pop("number_of_events", None)  # logbooks don't have experiment field
+        metadata["metadata"] = tgt
+        return metadata
+    elif isinstance(secondary, list) and any(str(s).lower() == "policy" for s in secondary):
+        tgt["dataset_type"] = "policy"
+        tgt["resource_type"] = {"id": "c_186u"} # zpráva k politice nebo strategii
         tgt.pop("collision_information", None)  # logbooks don't have collision info
         tgt.pop("number_of_events", None)  # logbooks don't have experiment field
         metadata["metadata"] = tgt
@@ -302,7 +389,7 @@ async def create_prod_client():
 
 async def create_test_client():
     config = Config()
-    token="vB8oxTj9j7i42scO0WMFwvlwQ5w70xLUhAlkXQCRTasA2jQnqZLBSD56Om5U"
+    token="6aGPfvMbN8K9Pj7VSxIMNEha21yIClggNApprmr4JR2UbCANtO0v1VEzgISp"
     # securely enter the token
     if token == "":
         token = getpass.getpass("Enter API token for repository: ").strip()
@@ -383,22 +470,26 @@ async def _upload_one_file(client, record, file_path: Path, sem: asyncio.Semapho
         )
 
 
-async def _write_stats(stats_path: Path | None, fmt: str, payload: dict):
+async def _write_stats(stats_path: Path | None, fmt: str, payload: dict, metadata: dict | None = None):
     if not stats_path:
         return
 
     def _sync_write():
         stats_path.parent.mkdir(parents=True, exist_ok=True)
+        row = dict(payload)
+        if metadata:
+            row.update(metadata)
         if fmt == "csv":
             write_header = not stats_path.exists()
             with stats_path.open("a", encoding="utf-8", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=sorted(payload.keys()))
+                writer = csv.DictWriter(fh, fieldnames=sorted(row.keys()))
                 if write_header:
                     writer.writeheader()
-                writer.writerow(payload)
+                writer.writerow(row)
         else:  # jsonl
             with stats_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                payload_with_metadata = dict(row)
+                fh.write(json.dumps(payload_with_metadata, ensure_ascii=False) + "\n")
 
     await asyncio.to_thread(_sync_write)
 
@@ -408,12 +499,11 @@ async def upload_record_async(
     recid: int,
     data_dir: Path,
     metadata_dir: Path,
-    template_path: Path = Path("delphi_nrp_example.json"),
     file_concurrency: int = 4,
     upload_limiter: WeightedSemaphore | None = None,
     zip_sem: asyncio.Semaphore | None = None,
     stats_path: Path | None = None,
-    stats_format: str = "jsonl",
+    stats_format: str = "csv",
 ):
     # Used by bulk_async.py as the single-record upload unit
     start = time.perf_counter()
@@ -423,31 +513,34 @@ async def upload_record_async(
     zip_used = False
     zip_path = None
     dataset_files: list[Path] = []
+    record = None
+    metadata = None
+    exc = None
     try:
         metadata_file = metadata_dir / f"{recid}.json"
         folder = data_dir / f"{recid}"
         if not metadata_file.exists():
             logger.warning("[%s] Missing metadata file: %s", recid, metadata_file)
-            return None
+            raise ValueError("Missing metadata file")
         if not folder.exists():
             logger.warning("[%s] Missing dataset folder: %s", recid, folder)
-            return None
+            raise ValueError("Missing dataset folder")
 
         dataset_files = [p for p in folder.glob("*") if p.is_file()]
         dataset_size = sum(p.stat().st_size for p in dataset_files if p.exists())
         logger.info("[%s] Found %s files in dataset folder, total size %.2f GB", recid, len(dataset_files), dataset_size / (1024 * 1024 * 1024))
 
-        with open(template_path, "r", encoding="utf-8") as file:
-            metadata = json.load(file)
+        with open(metadata_file, "r", encoding="utf-8") as fh:
+            source = json.load(fh)
 
         # Fill metadata template with actual values
-        metadata = fill_cern_metadata(metadata, metadata_file)
-        print(json.dumps(metadata, indent=2))
+        metadata = fill_cern_metadata(source)
+        # print(json.dumps(metadata, indent=2))
 
         # Create a new record
         record = await client.records.create(
             metadata,
-            model="particles" # , community="my-community-slug", workflow="review"
+            model="particles" , community= "test" # , community="my-community-slug", workflow="review"
         )
         logger.info("[%s] Created record: %s", recid, record.id)
 
@@ -495,13 +588,31 @@ async def upload_record_async(
             tasks = [asyncio.create_task(_upload_one_file(client, record, fp, sem, upload_limiter)) for fp in dataset_files]
             await asyncio.gather(*tasks)
 
-        published = await client.records.publish(record)
-        logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
-        return published
+        # published = await client.records.publish(record)
+        # logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
+        # return published
     except Exception as exc:
         status = "failed"
         error = str(exc)
-        raise
+        try:
+            await _write_stats(
+                stats_path,
+                stats_format,
+                {
+                    "recid": recid,
+                    "status": status,
+                    "error": error,
+                    "start_ts": start_ts,
+                    "duration_s": round(time.perf_counter() - start, 3),
+                    "file_count": len(dataset_files),
+                    "zip_used": zip_used,
+                    "url": str(record.links.self_html) if record else None,
+                },
+            )
+        except Exception:
+            logger.warning("[%s] Failed to write stats after error: %s", recid, exc, exc_info=True)
+        return exc
+
     finally:
         bytes_uploaded = 0
         try:
@@ -511,7 +622,13 @@ async def upload_record_async(
             elif dataset_files:
                 bytes_uploaded = sum(p.stat().st_size for p in dataset_files if p.exists())
         except Exception:
-            pass
+            logger.warning("[%s] Failed to calculate uploaded bytes", recid, exc_info=True)
+
+        metadata_source = {}
+        if record is not None:
+            metadata_source = record.metadata
+        elif isinstance(metadata, dict):
+            metadata_source = metadata.get("metadata", metadata)
 
         await _write_stats(
             stats_path,
@@ -524,10 +641,13 @@ async def upload_record_async(
                 "duration_s": round(time.perf_counter() - start, 3),
                 "file_count": len(dataset_files),
                 "zip_used": zip_used,
-                "bytes_uploaded": bytes_uploaded,
+                "record_size": bytes_uploaded,
                 "url": str(record.links.self_html) if record else None,
             },
+            metadata=serialize_metadata(metadata_source),
         )
+
+    return None
 
 
 def ensure_zip(dataset_files: list[Path], zip_path: Path):
@@ -582,11 +702,11 @@ async def ensure_zip_async(dataset_files: list[Path], zip_path: Path, zip_sem: a
 
 
 async def main_async() -> None:
-    # client = await create_test_client()
-    client = await create_local_client()
+    client = await create_test_client()
+    # client = await create_local_client()
     # client = await create_prod_client()
 
-    recid = 2
+    recid = 85104
     metadata_dir = Path("../metadata")
     data_dir = Path("../data")
 
@@ -595,9 +715,8 @@ async def main_async() -> None:
         recid=recid,
         data_dir=data_dir,
         metadata_dir=metadata_dir,
-        template_path=Path("delphi_nrp_example.json"),
-        stats_path=Path("upload_stats.jsonl"),
-        stats_format="jsonl",
+        stats_path=Path("upload_stats.csv"),
+        stats_format="csv",
     )
 
 
@@ -621,4 +740,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
