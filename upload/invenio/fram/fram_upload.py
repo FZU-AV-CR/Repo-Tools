@@ -593,5 +593,5 @@ if __name__ == "__main__":
 
 
 #   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/FRAM/Upload/Data to upload/cta-n/2021/20210409/03185" --dry-run
+#   python3 fram_upload.py --environment local --data-root "/home/[XXX]/Python WSL/FRAM/Upload/Data to upload/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4
