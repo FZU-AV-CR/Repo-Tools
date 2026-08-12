@@ -186,11 +186,10 @@ class FramWorkItem:
 
 
 def _relative_key(fits_path: Path, root: Path) -> str:
-    """Return the file path relative to the upload root, or after 'Data to
-    upload' if that folder name appears in the path (matches the historic
+    """Return the file path relative to the upload root, or after 'mnt' if that folder name appears in the path (matches the historic
     FRAM upload-tree convention, so site subfolders don't collide)."""
-    if "Data to upload" in fits_path.parts:
-        idx = fits_path.parts.index("Data to upload")
+    if "mnt" in fits_path.parts:
+        idx = fits_path.parts.index("mnt")
         return Path(*fits_path.parts[idx + 1:]).as_posix()
     return fits_path.relative_to(root).as_posix()
 
