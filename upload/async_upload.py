@@ -302,7 +302,7 @@ async def create_prod_client():
 
 async def create_test_client():
     config = Config()
-    token="vB8oxTj9j7i42scO0WMFwvlwQ5w70xLUhAlkXQCRTasA2jQnqZLBSD56Om5U"
+    token=""
     # securely enter the token
     if token == "":
         token = getpass.getpass("Enter API token for repository: ").strip()
@@ -321,7 +321,7 @@ async def create_local_client():
     config.add_repository(RepositoryConfig(
         alias="physica-local",
         url=URL("https://127.0.0.1:5000/"),
-        token="A9vVsdlTSuD0oBxMqNsT3mmtlGXZQp5lx85NLz2flpaH4cyy0Pp0scYyl0C2",
+        token="",
         verify_tls=False
     ))
     return await get_async_client("physica-local", config=config)

@@ -366,6 +366,30 @@ async def upload_record_async(
         record = await client.records.create(record_payload)
         logger.info("[%s] Created draft: %s", item.key, record.id)
 
+        # Self-referential URL identifier: Physics-repository records
+        # generally use the record's own landing-page URL as their
+        # identifier rather than minting a DOI (see the Delphi template's
+        # equivalent record.metadata["identifiers"][0] logic). An adapter
+        # opts in by including an {"identifier": "", "scheme": "url"} entry
+        # in the "identifiers" list returned from build_invenio_metadata();
+        # any such entry is filled in here and pushed back to the draft.
+        # Adapters that omit "identifiers" entirely, or that populate their
+        # own identifier scheme (e.g. a DOI), are unaffected -- no extra
+        # API call is made for them.
+        identifiers = getattr(record, "metadata", {}).get("identifiers") if hasattr(record, "metadata") else None
+        if identifiers:
+            filled = False
+            for ident in identifiers:
+                if ident.get("scheme") == "url" and not ident.get("identifier"):
+                    ident["identifier"] = str(record.links.self_html)
+                    filled = True
+            if filled:
+                record = await client.records.draft_records.update(record)
+                logger.info(
+                    "[%s] Filled self-URL identifier, now at revision: %s",
+                    item.key, getattr(record, "revision_id", None),
+                )
+
         for file_key, file_path, description in upload_files:
             if not file_path.exists():
                 raise FileNotFoundError(f"Missing file for upload: {file_path}")

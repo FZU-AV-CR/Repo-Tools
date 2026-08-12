@@ -258,6 +258,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
                     ),
                 }
             ],
+            "identifiers": [{"identifier": "", "scheme": "url"}],
             "subjects": [{"subject": s} for s in SUBJECTS],
             "rights": [{"id": "4-BY"}],
             "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
