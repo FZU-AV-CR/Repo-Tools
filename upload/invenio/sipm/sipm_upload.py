@@ -279,7 +279,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
             "file_types": ["csv", "txt", "pdf"],
             "title": title,
             "publication_date": extracted["publication_date"],
-            "publisher": "FZU Instsitute of Physics of the Czech Academy of Science",
+            "publisher": "FZU Institute of Physics of the Czech Academy of Science",
             "additional_descriptions": [
                 {
                     "lang": {"id": "ENG"},
