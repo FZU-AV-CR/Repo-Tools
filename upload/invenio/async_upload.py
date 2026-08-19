@@ -24,10 +24,30 @@ Every adapter module must provide:
     extract_metadata(item)             -> dict                (sync)
     validate_metadata(extracted)       -> list[str]            (sync)
     build_invenio_metadata(extracted)  -> dict  (with "metadata", "files",
-                                           "access", "communities" keys)
+                                           "access" keys, and optionally
+                                           "communities", "community",
+                                           "workflow" -- see below)
     get_upload_files(item, extracted)  -> list[(file_key, Path, description)]
 and the constant:
     DEFAULT_SCHEMA_URL                 -> str
+
+COMMUNITY / WORKFLOW: an adapter has two independent, non-exclusive ways to
+put a record into a community when calling records.create() (see
+nrp_cmd.async_client.invenio.records.AsyncInvenioRecordsClient.create()):
+  - the older manual style -- set a "communities" key (e.g.
+    {"ids": [...]}) inside the dict returned by build_invenio_metadata();
+    it's merged straight into the record's JSON body as a top-level
+    "communities" key (see below). Used by sipm_upload.py.
+  - the client's own community=/workflow= keyword arguments -- set
+    "community" (a community slug/id string) and/or "workflow" (a
+    workflow name string) keys in the dict returned by
+    build_invenio_metadata(); upload_record_async() below passes them
+    through as client.records.create(record_payload, community=...,
+    workflow=...), which the client turns into
+    record_payload["parent"]["communities"]["default"]/["workflow"]
+    itself. This is the mechanism documented in nrp_cmd's own usage guide
+    and is what fram_upload.py / fram_upload_test.py use. If "workflow"
+    is omitted, the community's default workflow is used.
 
 See adapters.py for the full interface and instructions for registering a
 new metadata model.
@@ -363,7 +383,18 @@ async def upload_record_async(
         if metadata.get("communities"):
             record_payload["communities"] = metadata["communities"]
 
-        record = await client.records.create(record_payload)
+        # Newer, client-native mechanism (see module docstring's
+        # "COMMUNITY / WORKFLOW" section): an adapter may instead (or
+        # additionally) set "community"/"workflow" keys, which are passed
+        # as records.create() keyword arguments rather than folded into
+        # the JSON body directly -- this is what fram_upload.py uses.
+        create_kwargs: dict[str, Any] = {}
+        if metadata.get("community"):
+            create_kwargs["community"] = metadata["community"]
+        if metadata.get("workflow"):
+            create_kwargs["workflow"] = metadata["workflow"]
+
+        record = await client.records.create(record_payload, **create_kwargs)
         logger.info("[%s] Created draft: %s", item.key, record.id)
 
         # Self-referential URL identifier: Physics-repository records

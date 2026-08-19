@@ -30,11 +30,14 @@ SiPM_upload3's `data_dir = DATA_ROOT / title.removeprefix("SiPM_")`.
 So the work item here carries a `data_dir`, not a single `zip_path`,
 and get_upload_files() uploads every ZIP found inside it.
 
-SiPM records need a `communities` block (old script set
-`{"ids": ["SiPM"]}`); async_upload.py's upload_record_async() includes it
-in the records.create() payload automatically whenever an adapter's
-build_invenio_metadata() sets one (ITk's doesn't, SiPM's does -- both work
-unmodified).
+COMMUNITY HANDLING: like fram_upload.py, this adapter sets "community"/
+"workflow" keys in build_invenio_metadata() -- migrated from the old
+manual `"communities": {"ids": ["SiPM"]}` dict (the old script's working
+value, "SiPM", is preserved as SIPM_COMMUNITY below; SIPM_WORKFLOW is a
+TO_FILL placeholder). async_upload.py's upload_record_async() passes
+these through automatically as the community=/workflow= keyword
+arguments of client.records.create() (see its "COMMUNITY / WORKFLOW"
+docstring section), so no engine change is needed.
 
 Which adapter is active is resolved at runtime by adapters.py, not
 hardcoded in async_upload.py/bulk_async.py: this file passes
@@ -60,9 +63,9 @@ from pathlib import Path
 # for real runs)
 # ============================================================
 
-DEFAULT_METADATA_DIR = "/home/[XX]/Python WSL/SiPM/Upload/Metadata"
-DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/SiPM/Upload/Data to upload"
-DEFAULT_README_FILE = "/home/[XX]/Python WSL/SiPM/Upload/README.txt"
+DEFAULT_METADATA_DIR = "/home/erutherford/Python WSL/SiPM/Upload/Metadata"
+DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/SiPM/Upload/Data to upload"
+DEFAULT_README_FILE = "/home/erutherford/Python WSL/SiPM/Upload/README.txt"
 
 # Must match this adapter's key in adapters.ADAPTERS.
 ADAPTER_NAME = "sipm"
@@ -70,6 +73,13 @@ ADAPTER_NAME = "sipm"
 # Confirmed for local only so far; verify before using with test1/production
 # (same caveat as ITk's / FRAM's DEFAULT_SCHEMA_URL).
 DEFAULT_SCHEMA_URL = "local://sipm-v1.0.0.json"
+
+# Migrated from the old manual "communities": {"ids": ["SiPM"]} dict to
+# the community=/workflow= keyword-argument mechanism (see
+# async_upload.py's "COMMUNITY / WORKFLOW" docstring section).
+SIPM_COMMUNITY = "SiPM"
+# TO_FILL -- workflow not yet decided for SiPM.
+SIPM_WORKFLOW = "TO_FILL"
 
 # ============================================================
 # FIXED METADATA  (unchanged from SiPM_upload2_create_metadata.py)
@@ -273,6 +283,8 @@ def build_invenio_metadata(extracted: dict) -> dict:
     title = re.sub(r"\s+", "_", extracted["title"])
     return {
         "metadata": {
+            "related_resources": [{"title": "SiPM_2022", "identifiers": [{"identifier": "https://127.0.0.1:5000/sipm/records/5xgdm-9ev10", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+                                {"title": "SiPM", "identifiers": [{"identifier": "https://127.0.0.1:5000/sipm/records/5xgdm-9ev77", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],    
             "resource_type": {"id": "c_ddb1"},
             "creators": CREATORS,
             "contributors": CONTRIBUTORS,
@@ -314,7 +326,12 @@ def build_invenio_metadata(extracted: dict) -> dict:
             "embargo": {"active": "false", "reason": "null"},
             "status": "restricted",
         },
-        "communities": {"ids": ["SiPM"]},
+        # See SIPM_COMMUNITY / SIPM_WORKFLOW above and the "COMMUNITY
+        # HANDLING" section of the module docstring. async_upload.py
+        # passes these through as client.records.create()'s community=/
+        # workflow= keyword arguments automatically.
+        "community": SIPM_COMMUNITY,
+        "workflow": SIPM_WORKFLOW,
     }
 
 
@@ -415,4 +432,4 @@ if __name__ == "__main__":
 
 
 #   cd upload/invenio/sipm
-#   python3 sipm_upload.py --enviornment test1
+#   python3 sipm_upload.py --environment test1

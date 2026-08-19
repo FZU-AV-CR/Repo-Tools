@@ -25,8 +25,13 @@ Adding a new metadata model:
          extract_metadata(item)             -> dict                (sync)
          validate_metadata(extracted)       -> list[str]           (sync)
          build_invenio_metadata(extracted)  -> dict  (with "metadata",
-                                                "files", "access",
-                                                "communities" keys)
+                                                "files", "access" keys,
+                                                and optionally
+                                                "communities", "community",
+                                                "workflow" -- see
+                                                async_upload.py's
+                                                "COMMUNITY / WORKFLOW"
+                                                docstring section)
          get_upload_files(item, extracted)  -> list[(file_key, Path, description)]
      plus the constants DEFAULT_SCHEMA_URL, DEFAULT_METADATA_DIR,
      DEFAULT_DATA_ROOT, DEFAULT_README_FILE, and the same

@@ -26,6 +26,15 @@ now this file still reads pre-existing *.txt files, same as before.
 Token handling mirrors FRAM: nothing is hardcoded here. bulk_async.py /
 async_upload.py resolve it the same way as fram_bulk_async.py did
 (--token flag -> INVENIO_TOKEN env var -> interactive prompt).
+
+COMMUNITY HANDLING: like fram_upload.py, this adapter sets "community"/
+"workflow" keys in build_invenio_metadata(); async_upload.py's
+upload_record_async() passes them through automatically as the
+community=/workflow= keyword arguments of client.records.create() (see
+its "COMMUNITY / WORKFLOW" docstring section), so no engine change is
+needed. ITK_COMMUNITY / ITK_WORKFLOW below are TO_FILL placeholders --
+update them once Cesnet/FZU finalizes the community/access workflow for
+this model.
 """
 
 from __future__ import annotations
@@ -40,8 +49,8 @@ from pathlib import Path
 # for real runs)
 # ============================================================
 
-DEFAULT_METADATA_DIR = "/home/[XX]/Python WSL/ITk/Upload/Metadata"
-DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/ITk/Upload/Data to upload"
+DEFAULT_METADATA_DIR = "/home/erutherford/Python WSL/ITk/Upload/Metadata"
+DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/ITk/Upload/Data to upload"
 DEFAULT_README_FILE = None  # README is optional -- pass --readme-file to include one
 
 # Must match this adapter's key in adapters.ADAPTERS.
@@ -50,6 +59,14 @@ ADAPTER_NAME = "itk"
 # Confirmed for local only so far; verify before using with test1/production
 # (same caveat as FRAM's DEFAULT_SCHEMA_URL).
 DEFAULT_SCHEMA_URL = "local://atlas_itk-v1.0.0.json"
+
+# TO_FILL -- community/workflow not yet decided for ITk. Update once
+# Cesnet/FZU finalizes the community/access workflow for this model (see
+# fram_upload.py's FRAM_COMMUNITY for the equivalent, already-resolved
+# case, and async_upload.py's "COMMUNITY / WORKFLOW" docstring section
+# for the mechanism).
+ITK_COMMUNITY = "TO_FILL"
+ITK_WORKFLOW = "TO_FILL"
 
 # ============================================================
 # FIXED METADATA  (unchanged from ITk_upload2_create_metadata.py)
@@ -240,6 +257,9 @@ def build_invenio_metadata(extracted: dict) -> dict:
     title = extracted["title"].replace(" ", "_")
     return {
         "metadata": {
+
+            "related_resources": [{"title": "ITK_2022", "identifiers": [{"identifier": "https://127.0.0.1:5000/atlas_itk/records/5xgdm-9ev10", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+                                {"title": "ITk", "identifiers": [{"identifier": "https://127.0.0.1:5000/atlas_itk/records/5xgdm-9ev77", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],            
             "resource_type": {"id": "c_ddb1"},
             "creators": CREATORS,
             "contributors": CONTRIBUTORS,
@@ -278,6 +298,12 @@ def build_invenio_metadata(extracted: dict) -> dict:
             "embargo": {"active": "false", "reason": "null"},
             "status": "restricted",
         },
+        # See ITK_COMMUNITY / ITK_WORKFLOW above and the "COMMUNITY
+        # HANDLING" section of the module docstring. async_upload.py
+        # passes these through as client.records.create()'s community=/
+        # workflow= keyword arguments automatically.
+        "community": ITK_COMMUNITY,
+        "workflow": ITK_WORKFLOW,
     }
 
 

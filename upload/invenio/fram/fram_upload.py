@@ -36,12 +36,19 @@ Linearization is intentionally NOT applied -- mean/median reflect crop+bias
 only. The archived FITS file itself is always the untouched original
 either way.
 
-COMMUNITY HANDLING: like SiPM, FRAM sets a "communities" block in
-build_invenio_metadata(); async_upload.py's upload_record_async() includes
-it in the records.create() payload automatically whenever an adapter sets
-one (see its "if metadata.get('communities')" check), so no engine change
-is needed. FRAM_COMMUNITY_IDS below is a draft placeholder -- update it
-once Cesnet finalizes the community/access workflow for this model.
+COMMUNITY HANDLING: unlike SiPM's manual "communities" dict, FRAM sets a
+"community" key in build_invenio_metadata() (the community slug, e.g.
+"fram1"); async_upload.py's upload_record_async() passes it through as the
+community= keyword argument of client.records.create() automatically
+whenever an adapter sets one (see its "if metadata.get('community')"
+check and the "COMMUNITY / WORKFLOW" section of its module docstring), so
+no further engine change is needed. This mirrors the usage shown in
+nrp_cmd's own guide, e.g.:
+    record = await client.records.create(
+        {...}, community="my-community", workflow="review"
+    )
+FRAM_COMMUNITY below is the community slug currently in use; update it if
+Cesnet's community/access workflow for this model changes.
 
 KNOWN OPEN ITEM: camera_serial is read from the CCD_SER header keyword.
 calibrate.py's own find_calibration_config() internally keys off a
@@ -95,7 +102,7 @@ warnings.simplefilter("ignore", FITSFixedWarning)
 # as DEFAULT_DATA_ROOT so bulk_async.py's "does metadata_dir exist?"
 # preflight check passes trivially. discover_items() below ignores its
 # metadata_dir argument entirely.
-DEFAULT_DATA_ROOT = "/home/[XX]/Python WSL/FRAM/Upload/Data to upload"
+DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/FRAM/Upload/Data to upload"
 DEFAULT_METADATA_DIR = DEFAULT_DATA_ROOT
 DEFAULT_README_FILE = None  # no shared README wired up yet for FRAM (open item)
 
@@ -161,11 +168,11 @@ SUBJECTS = [
     "Roque de los Muchachos",
 ]
 
-# Draft placeholder -- community/access workflow not finalized yet (see
-# Physics repository info.docx: "We wait for Cesnet to provide community
-# and access workflows"). Update once available, same pattern as SiPM's
-# own community-id constant in sipm_upload.py.
-FRAM_COMMUNITY_IDS = ["FRAM"]
+# Community slug FRAM records are created under, passed to
+# client.records.create() as the community= keyword argument (see
+# "COMMUNITY HANDLING" in the module docstring above). Update if Cesnet
+# changes the community/access workflow for this model.
+FRAM_COMMUNITY = "fram1id"
 
 
 # ============================================================
@@ -210,8 +217,7 @@ def discover_items(
     files, since each FITS file's own header is its metadata.
 
     readme_file is likewise accepted but unused for now -- FRAM's
-    per-experiment README referencing scheme is still an open item (see
-    Physics repository info.docx).
+    per-experiment README referencing scheme is still an open item).
     """
     items: list[FramWorkItem] = []
     log_every = 50_000
@@ -458,6 +464,8 @@ def build_invenio_metadata(extracted: dict) -> dict:
                 }
             ],
             "identifiers": [{"identifier": "", "scheme": "url"}],
+            "related_resources": [{"title": "FRAM_2022_cta-n", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/5xgdm-9ev10", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+                                  {"title": "FRAM", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/5xgdm-9ev77", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
             "subjects": [{"subject": s} for s in SUBJECTS],
             "rights": [{"id": "4-BY"}],
             "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
@@ -497,9 +505,13 @@ def build_invenio_metadata(extracted: dict) -> dict:
             "embargo": {"active": "false", "reason": "null"},
             "status": "restricted",
         },
-        # Draft placeholder -- see FRAM_COMMUNITY_IDS above. async_upload.py
-        # includes this in the records.create() payload automatically.
-        "communities": {"ids": FRAM_COMMUNITY_IDS},
+        # See FRAM_COMMUNITY above and the "COMMUNITY HANDLING" section of
+        # the module docstring. async_upload.py passes this through as
+        # client.records.create()'s community= keyword argument
+        # automatically.
+        "community": FRAM_COMMUNITY,
+        "communities": [{"identifier": FRAM_COMMUNITY}
+    ]
     }
 
 
@@ -547,6 +559,20 @@ def get_upload_files(item: FramWorkItem, extracted: dict) -> list[tuple[str, Pat
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _extract_flag_value(argv: list[str], flag: str) -> str | None:
+    """Return the value passed for `flag` (either "--flag value" or
+    "--flag=value" form) in `argv`, or None if it's absent. If the flag is
+    repeated, the last occurrence wins, matching argparse's own behaviour.
+    """
+    value = None
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith(flag + "="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
 def _run_via_bulk_async() -> None:
     import importlib
     import sys
@@ -572,9 +598,24 @@ def _run_via_bulk_async() -> None:
     # itself since it's an explicit CLI arg.
     os.environ.setdefault("PHYSICS_ADAPTER", ADAPTER_NAME)
 
+    # By convention (see module docstring), --metadata-dir must always
+    # mirror --data-root for FRAM -- there's no real metadata directory,
+    # so bulk_async.py's "does metadata_dir exist?" preflight check is
+    # trivially satisfied by pointing it at data_root. DEFAULT_METADATA_DIR
+    # only mirrors DEFAULT_DATA_ROOT at *module import time*, though, so if
+    # the caller overrides --data-root on the CLI (e.g. to point at the
+    # real server path instead of the intentionally-bogus default), that
+    # override must also be picked up here for --metadata-dir; otherwise
+    # argparse's last-flag-wins behaviour leaves --metadata-dir pinned to
+    # the stale/bogus DEFAULT_METADATA_DIR while --data-root itself is
+    # correctly overridden -- which is exactly the "default data root does
+    # not exist" error this fixes.
+    user_data_root = _extract_flag_value(sys.argv[1:], "--data-root")
+    effective_data_root = user_data_root or DEFAULT_DATA_ROOT
+
     default_flags = {
         "--adapter": ADAPTER_NAME,
-        "--metadata-dir": DEFAULT_METADATA_DIR,
+        "--metadata-dir": effective_data_root,
         "--data-root": DEFAULT_DATA_ROOT,
     }
     if DEFAULT_README_FILE:
@@ -593,5 +634,5 @@ if __name__ == "__main__":
 
 
 #   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/[XXX]/Python WSL/FRAM/Upload/Data to upload/cta-n/2021/20210409/03185" --dry-run
+#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4
