@@ -102,7 +102,7 @@ warnings.simplefilter("ignore", FITSFixedWarning)
 # as DEFAULT_DATA_ROOT so bulk_async.py's "does metadata_dir exist?"
 # preflight check passes trivially. discover_items() below ignores its
 # metadata_dir argument entirely.
-DEFAULT_DATA_ROOT = "/home/erutherford/Python WSL/FRAM/Upload/Data to upload"
+DEFAULT_DATA_ROOT = "/home/[xyz]/Python WSL/FRAM/Upload/Data to upload"
 DEFAULT_METADATA_DIR = DEFAULT_DATA_ROOT
 DEFAULT_README_FILE = None  # no shared README wired up yet for FRAM (open item)
 
@@ -172,7 +172,7 @@ SUBJECTS = [
 # client.records.create() as the community= keyword argument (see
 # "COMMUNITY HANDLING" in the module docstring above). Update if Cesnet
 # changes the community/access workflow for this model.
-FRAM_COMMUNITY = "fram1id"
+FRAM_COMMUNITY = "fram"
 
 
 # ============================================================
@@ -464,7 +464,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
                 }
             ],
             "identifiers": [{"identifier": "", "scheme": "url"}],
-            "related_resources": [{"title": "FRAM_2022_cta-n", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/5xgdm-9ev10", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+            "related_resources": [{"title": "FRAM_2022_cta-n", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/s0as8-05q28", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
                                   {"title": "FRAM", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/5xgdm-9ev77", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
             "subjects": [{"subject": s} for s in SUBJECTS],
             "rights": [{"id": "4-BY"}],
@@ -509,7 +509,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
         # the module docstring. async_upload.py passes this through as
         # client.records.create()'s community= keyword argument
         # automatically.
-        "community": FRAM_COMMUNITY,
+        # "community": FRAM_COMMUNITY,
         "communities": [{"identifier": FRAM_COMMUNITY}
     ]
     }
@@ -634,5 +634,5 @@ if __name__ == "__main__":
 
 
 #   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
+#   python3 fram_upload.py --environment local --data-root "/home/[xyz]/Python WSL/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4

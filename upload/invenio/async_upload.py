@@ -26,28 +26,32 @@ Every adapter module must provide:
     build_invenio_metadata(extracted)  -> dict  (with "metadata", "files",
                                            "access" keys, and optionally
                                            "communities", "community",
-                                           "workflow" -- see below)
+                                           "workflow", "model" -- see below)
     get_upload_files(item, extracted)  -> list[(file_key, Path, description)]
 and the constant:
     DEFAULT_SCHEMA_URL                 -> str
 
-COMMUNITY / WORKFLOW: an adapter has two independent, non-exclusive ways to
-put a record into a community when calling records.create() (see
+COMMUNITY / WORKFLOW / MODEL: an adapter has two independent, non-exclusive
+ways to put a record into a community when calling records.create() (see
 nrp_cmd.async_client.invenio.records.AsyncInvenioRecordsClient.create()):
   - the older manual style -- set a "communities" key (e.g.
     {"ids": [...]}) inside the dict returned by build_invenio_metadata();
     it's merged straight into the record's JSON body as a top-level
     "communities" key (see below). Used by sipm_upload.py.
-  - the client's own community=/workflow= keyword arguments -- set
-    "community" (a community slug/id string) and/or "workflow" (a
-    workflow name string) keys in the dict returned by
-    build_invenio_metadata(); upload_record_async() below passes them
-    through as client.records.create(record_payload, community=...,
-    workflow=...), which the client turns into
-    record_payload["parent"]["communities"]["default"]/["workflow"]
-    itself. This is the mechanism documented in nrp_cmd's own usage guide
-    and is what fram_upload.py / fram_upload_test.py use. If "workflow"
-    is omitted, the community's default workflow is used.
+  - the client's own community=/workflow=/model= keyword arguments -- set
+    "community" (a community slug/id string), "workflow" (a workflow name
+    string), and/or "model" (a metadata-model name string, e.g. the
+    original Delphi script's model="particles") keys in the dict returned
+    by build_invenio_metadata(); upload_record_async() below passes
+    whichever of these are present through as keyword arguments to
+    client.records.create(), e.g. client.records.create(record_payload,
+    community=..., workflow=..., model=...). community/workflow get
+    turned into record_payload["parent"]["communities"]["default"]/
+    ["workflow"] by the client itself -- this is the mechanism documented
+    in nrp_cmd's own usage guide and is what fram_upload.py /
+    fram_upload_test.py use. If "workflow" is omitted, the community's
+    default workflow is used. "model" has no such transformation -- it's
+    passed through as-is.
 
 See adapters.py for the full interface and instructions for registering a
 new metadata model.
@@ -66,6 +70,8 @@ import json
 import logging
 import os
 import time
+import zipfile
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -153,11 +159,25 @@ ENVIRONMENTS = {
 # Canonical stats row schema -- every call to _write_stats supplies exactly
 # this set of keys so the CSV header stays consistent across "started" and
 # terminal rows.
+#
+# attempt / max_attempts: an item that fails and is retried by
+# bulk_async.py's _upload_with_retries() produces MULTIPLE rows sharing the
+# same key -- e.g. attempt=1 status=failed, attempt=2 status=failed,
+# attempt=3 status=ok. Without these two fields, scanning the CSV for
+# status=="failed" flags items that ultimately succeeded on a later retry,
+# which is misleading. To find items that TRULY failed (exhausted all
+# retries), filter for status=="failed" AND attempt==max_attempts. To find
+# every item's final outcome regardless of status, take the last row per
+# key (by start_ts) or equivalently the row where attempt==max_attempts OR
+# status=="ok". See the "reading upload_stats.csv" note near
+# _upload_with_retries() in bulk_async.py.
 STATS_FIELDS = (
     "key",
     "recid",
     "status",
     "error",
+    "attempt",
+    "max_attempts",
     "start_ts",
     "duration_s",
     "file_count",
@@ -246,6 +266,204 @@ async def create_client_for_environment(
 
 
 # ============================================================
+# TRANSFER LIMITER
+# (restored from the original, model-specific Delphi async_upload.py this
+# engine was generalized from -- dropped during generalization, which is
+# suspected to be a factor in HTTP transfer errors / bulk_async.py's
+# circuit breaker tripping under high --max-concurrency, since nothing was
+# left bounding how many large file transfers can be in flight at once.
+# See bulk_async.py's --transfer-weight-budget flag for how this is sized.)
+#
+# Concurrency of *records* (--max-concurrency) and concurrency of *transfer
+# weight* (this limiter) are independent: a large --max-concurrency lets
+# many records' extract/create/publish steps overlap, while this limiter
+# is the thing that actually caps how many bytes-in-flight hit the
+# repository/network at once, regardless of how many records are "active".
+# ============================================================
+
+
+class WeightedSemaphore:
+    """Like asyncio.Semaphore, but acquire()/release() take a weight
+    instead of always being 1. Used so a single multipart ("M") transfer
+    of a large file can count for more of the shared transfer budget than
+    a small single-shot ("L") transfer, rather than treating every
+    in-flight file upload as equivalent regardless of size."""
+
+    def __init__(self, value: int):
+        self._value = value
+        self._cond = asyncio.Condition()
+
+    async def acquire(self, weight: int = 1) -> None:
+        async with self._cond:
+            while self._value < weight:
+                await self._cond.wait()
+            self._value -= weight
+
+    async def release(self, weight: int = 1) -> None:
+        async with self._cond:
+            self._value += weight
+            self._cond.notify_all()
+
+    @asynccontextmanager
+    async def slot(self, weight: int = 1):
+        await self.acquire(weight)
+        try:
+            yield
+        finally:
+            await self.release(weight)
+
+
+@asynccontextmanager
+async def _maybe_weighted_slot(limiter: "WeightedSemaphore | None", weight: int = 1):
+    if limiter is None:
+        yield
+        return
+    async with limiter.slot(weight):
+        yield
+
+
+# Files at or above this size use a multipart ("M") transfer instead of a
+# single-shot local ("L") one, and count for MULTIPART_WEIGHT of the
+# shared transfer budget instead of 1. Matches the 10 MB threshold /
+# 5x weighting used by the original Delphi script.
+MULTIPART_THRESHOLD_BYTES = 10 * 1024 * 1024
+MULTIPART_WEIGHT = 5
+
+
+def _transfer_type_for(file_path: Path) -> str:
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        # Missing/unreadable file: let the subsequent upload call raise a
+        # clearer error rather than guessing here.
+        return "L"
+    return "M" if size >= MULTIPART_THRESHOLD_BYTES else "L"
+
+
+def _transfer_weight_for(transfer_type: str) -> int:
+    return MULTIPART_WEIGHT if transfer_type == "M" else 1
+
+
+async def _upload_file_with_limiter(
+    client,
+    record,
+    *,
+    key: str,
+    metadata: dict,
+    source: str,
+    file_path: Path,
+    limiter: "WeightedSemaphore | None" = None,
+):
+    """Upload a single file with an explicit, size-based transfer_type
+    (restored from the original Delphi script -- omitting transfer_type
+    left it up to the client library's own default, which is suspected to
+    be behind HTTP transfer errors on larger files) and, if a limiter is
+    supplied, hold a weighted slot in the shared transfer budget for the
+    duration of the transfer."""
+    transfer_type = _transfer_type_for(file_path)
+    weight = _transfer_weight_for(transfer_type)
+    async with _maybe_weighted_slot(limiter, weight):
+        return await client.files.upload(
+            record, key=key, metadata=metadata, source=source, transfer_type=transfer_type,
+        )
+
+
+# ============================================================
+# ZIP BUNDLING
+# (ported from the original, model-specific Delphi async_upload.py as a
+# generic utility -- not wired into the core pipeline directly, since the
+# decision of *whether* to bundle a record's files into a zip belongs to
+# an adapter's own get_upload_files() (e.g. "more than 20 loose files ->
+# zip them"), not to this shared engine. An adapter that wants Delphi's
+# original bundling behavior can call ensure_zip_async() from its own
+# get_upload_files() / a pre-processing step and return the resulting zip
+# path as its single upload file, the same way Delphi's original script
+# did inline.
+#
+# NOTE: ensure_zip() below deletes each original file (fp.unlink()) once
+# it's been written into the archive -- this matches the original script's
+# behavior exactly, but means it is destructive to the source files. Any
+# adapter using this should be deliberate about that, and pass an
+# already-known-safe-to-delete file list.
+# ============================================================
+
+
+def ensure_zip(dataset_files: list[Path], zip_path: Path) -> None:
+    """Bundle dataset_files into a single zip at zip_path, removing each
+    original file once archived. If zip_path already exists, updates it
+    in place (adds any files not yet present or newer than their zip
+    entry) rather than recreating it from scratch -- safe to call again
+    after a partial/interrupted previous run. Sync/blocking; call via
+    ensure_zip_async() from async code."""
+    existing_files = [p for p in dataset_files if p.exists()]
+    if zip_path in existing_files:
+        existing_files.remove(zip_path)
+
+    if zip_path.exists():
+        if not existing_files:
+            logger.info("Zip archive exists and originals are already removed: %s", zip_path)
+            return
+
+        updated = 0
+        with zipfile.ZipFile(zip_path, "a", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            zip_info = {zi.filename: zi for zi in zf.infolist()}
+            for fp in existing_files:
+                zi = zip_info.get(fp.name)
+                if zi is None:
+                    zf.write(fp, arcname=fp.name)
+                    fp.unlink()
+                    updated += 1
+                    continue
+
+                # Compare zip entry timestamp to file mtime
+                zip_ts = time.mktime(zi.date_time + (0, 0, -1))
+                if fp.stat().st_mtime > zip_ts:
+                    logger.warning("Zip archive has outdated file %s", fp.name)
+                    updated += 1
+                else:
+                    fp.unlink()
+
+        logger.info(
+            "Zip archive updated (fixed in place): %s, files added: %s, originals removed: %s",
+            zip_path, updated, len(existing_files) - updated,
+        )
+        return
+
+    if not existing_files:
+        logger.warning("No original files to zip and no zip found: %s", zip_path)
+        return
+
+    logger.info("Too many files to upload individually, creating a zip archive...")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for fp in existing_files:
+            zf.write(fp, arcname=fp.name)
+            fp.unlink()
+
+    logger.info("Created zip archive: %s", zip_path)
+
+
+async def ensure_zip_async(
+    dataset_files: list[Path], zip_path: Path, zip_sem: "asyncio.Semaphore | None" = None
+) -> None:
+    """Async wrapper around ensure_zip(), running the blocking zip I/O in
+    a thread. Pass a shared asyncio.Semaphore as zip_sem to bound how many
+    zip-creation operations run concurrently across a batch (zip creation
+    is CPU/IO-bound and independent of the network transfer limiter
+    above)."""
+    async with _maybe_sem(zip_sem):
+        await asyncio.to_thread(ensure_zip, dataset_files, zip_path)
+
+
+@asynccontextmanager
+async def _maybe_sem(sem: "asyncio.Semaphore | None"):
+    if sem is None:
+        yield
+        return
+    async with sem:
+        yield
+
+
+# ============================================================
 # CHECKSUM
 # ============================================================
 
@@ -265,7 +483,7 @@ def compute_md5(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 def _stats_payload(key: str, **overrides) -> dict:
     payload = {field: None for field in STATS_FIELDS}
-    payload.update(key=key, file_count=0, zip_used=False, bytes_uploaded=0)
+    payload.update(key=key, file_count=0, zip_used=False, bytes_uploaded=0, attempt=1, max_attempts=1)
     payload.update(overrides)
     return payload
 
@@ -304,6 +522,10 @@ async def upload_record_async(
     dry_run: bool = False,
     validate: bool = True,
     schema_url: str | None = None,
+    upload_limiter: "WeightedSemaphore | None" = None,
+    file_concurrency: int = 1,
+    attempt: int = 1,
+    max_attempts: int = 1,
 ) -> object | None:
     """
     Full pipeline for a single record: extract -> validate -> build
@@ -319,6 +541,22 @@ async def upload_record_async(
     _scan_stats()), which may indicate an orphaned draft in the repository
     worth checking manually. This is not a full transactional guarantee --
     just enough to make crashes visible instead of silent.
+
+    attempt / max_attempts are supplied by the caller (bulk_async.py's
+    retry wrapper passes the current attempt number and its configured
+    retry count) purely so they end up in the stats CSV -- see the
+    STATS_FIELDS comment for why that matters when reading the CSV back.
+    A direct caller not using bulk_async.py's retry wrapper can safely
+    leave both at their default of 1.
+
+    file_concurrency bounds how many of this record's own files (per
+    get_upload_files()) upload at once -- irrelevant for adapters like
+    FRAM that return exactly one file per record, but lets an adapter like
+    Delphi's (multiple files per record) upload them concurrently instead
+    of strictly one-at-a-time. Each individual file transfer still also
+    goes through the shared, global upload_limiter regardless of this
+    value, so file_concurrency only affects how many of *this record's*
+    files can be waiting on that shared limiter simultaneously.
     """
     if adapter is None:
         raise RuntimeError(
@@ -366,7 +604,8 @@ async def upload_record_async(
             stats_path,
             stats_format,
             _stats_payload(
-                item.key, status="started", start_ts=start_ts, zip_used=zip_used, checksum_md5=checksum_md5,
+                item.key, status="started", start_ts=start_ts, zip_used=zip_used,
+                checksum_md5=checksum_md5, attempt=attempt, max_attempts=max_attempts,
             ),
         )
 
@@ -393,6 +632,13 @@ async def upload_record_async(
             create_kwargs["community"] = metadata["community"]
         if metadata.get("workflow"):
             create_kwargs["workflow"] = metadata["workflow"]
+        # "model" is a third, independent kwarg some deployments need to
+        # route record creation to the right metadata model (e.g. the
+        # original Delphi script calls client.records.create(metadata,
+        # model="particles")). Optional and omitted entirely unless an
+        # adapter's build_invenio_metadata() sets "model".
+        if metadata.get("model"):
+            create_kwargs["model"] = metadata["model"]
 
         record = await client.records.create(record_payload, **create_kwargs)
         logger.info("[%s] Created draft: %s", item.key, record.id)
@@ -421,18 +667,29 @@ async def upload_record_async(
                     item.key, getattr(record, "revision_id", None),
                 )
 
-        for file_key, file_path, description in upload_files:
+        file_sem = asyncio.Semaphore(max(1, file_concurrency))
+
+        async def _upload_one(file_key: str, file_path: Path, description: str) -> int:
             if not file_path.exists():
                 raise FileNotFoundError(f"Missing file for upload: {file_path}")
-            file_ = await client.files.upload(
-                record,
-                key=file_key,
-                metadata={"description": description},
-                source=str(file_path),
-            )
+            async with file_sem:
+                file_ = await _upload_file_with_limiter(
+                    client,
+                    record,
+                    key=file_key,
+                    metadata={"description": description},
+                    source=str(file_path),
+                    file_path=file_path,
+                    limiter=upload_limiter,
+                )
             logger.info("[%s] Uploaded: %s", item.key, file_.key)
-            bytes_uploaded += file_path.stat().st_size
-            file_count += 1
+            return file_path.stat().st_size
+
+        upload_sizes = await asyncio.gather(
+            *[_upload_one(fk, fp, desc) for fk, fp, desc in upload_files]
+        )
+        bytes_uploaded += sum(upload_sizes)
+        file_count += len(upload_files)
 
         published = await client.records.publish(record)
         logger.info("[%s] Published: %s", item.key, published.id)
@@ -451,6 +708,8 @@ async def upload_record_async(
                 recid=getattr(published, "id", None),
                 status=status,
                 error=error,
+                attempt=attempt,
+                max_attempts=max_attempts,
                 start_ts=start_ts,
                 duration_s=round(time.perf_counter() - start, 3),
                 file_count=file_count,
@@ -499,7 +758,12 @@ async def main_async(adapter_name: str | None = None) -> None:
         print("No work items discovered.")
         return
 
-    await upload_record_async(client=client, item=items[0], stats_path=Path("upload_stats.csv"))
+    await upload_record_async(
+        client=client,
+        item=items[0],
+        stats_path=Path("upload_stats.csv"),
+        upload_limiter=WeightedSemaphore(50),
+    )
 
 
 def main() -> None:
