@@ -440,7 +440,7 @@ def validate_metadata(extracted: dict) -> list[str]:
 
 
 def build_invenio_metadata(extracted: dict) -> dict:
-    title = "FRAM_" + Path(extracted["filename"]).stem
+    title = "FRAM_" + Path(extracted["site"]).stem + "_" + Path(extracted["ccd"]).stem + "_" + Path(extracted["filename"]).stem
     publication_date = datetime.date.today().isoformat()
 
     return {
