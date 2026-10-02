@@ -651,8 +651,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
             # literal string "null" rather than real JSON null -- sending
             # native types here removes the dependency on that coercion
             # happening at all, and fixes "reason" outright.
-            "embargo": {"active": False, "reason": None},
-            "status": "restricted",
+            "embargo": {"active": False, "reason": None}
         },
         # Passed through by async_upload.py as client.records.create()'s
         # community= keyword argument -- see "COMMUNITY HANDLING" in the
