@@ -50,19 +50,19 @@ nrp_cmd's own guide, e.g.:
 FRAM_COMMUNITY below is the community slug currently in use; update it if
 Cesnet's community/access workflow for this model changes.
 
-KNOWN OPEN ITEM: camera_serial is read from the CCD_SER header keyword.
-calibrate.py's own find_calibration_config() internally keys off a
-DIFFERENT header field, header['product_id'] (seen as a HIERARCH keyword
-in sample headers so far), to look up airtemp-based bias fallbacks and
-linearization curves. That lookup is independent of what we put in the
-output metadata, but if header['product_id'] is not resolvable on the
-header object crop_overscans() receives -- e.g. because it's only present
-in the primary HDU while extract_metadata() reads the header via
-fits.getheader(path, -1), the *last* HDU -- find_calibration_config() will
-raise a KeyError for any file whose overscan can't be measured directly
-from the pixel data. Worth checking against a real file before a
-production run. Left unresolved here, same as in the previous
-fram_async_upload.py.
+KNOWN OPEN ITEM: camera_serial is now read from the PRODUCT_ID header
+keyword (a HIERARCH keyword in sample headers so far), matching the same
+field calibrate.py's own find_calibration_config() already keys off of
+internally for airtemp-based bias fallbacks and linearization curves --
+this resolves the previous field-name mismatch between the two. What
+remains open: if PRODUCT_ID is not resolvable on the header object
+crop_overscans() receives -- e.g. because it's only present in the
+primary HDU while extract_metadata() reads the header via
+fits.getheader(path, -1), the *last* HDU -- find_calibration_config()
+will raise a KeyError for any file whose overscan can't be measured
+directly from the pixel data, and camera_serial in the output metadata
+will be None rather than raising. Worth checking against a real file
+before a production run.
 
 Which adapter is active is resolved at runtime by adapters.py, not
 hardcoded in async_upload.py/bulk_async.py: this file passes --adapter
@@ -79,7 +79,10 @@ bulk_async.py / async_upload.py resolve it the same way
 from __future__ import annotations
 
 import datetime
+import fnmatch
+import logging
 import os
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +96,8 @@ from calibrate import crop_overscans
 
 warnings.simplefilter("ignore", FITSFixedWarning)
 
+logger = logging.getLogger(__name__)
+
 # ============================================================
 # DEFAULTS (used by async_upload.py's smoke test; override via CLI flags
 # for real runs)
@@ -102,7 +107,7 @@ warnings.simplefilter("ignore", FITSFixedWarning)
 # as DEFAULT_DATA_ROOT so bulk_async.py's "does metadata_dir exist?"
 # preflight check passes trivially. discover_items() below ignores its
 # metadata_dir argument entirely.
-DEFAULT_DATA_ROOT = "/home/[xyz]/Python WSL/FRAM/Upload/Data to upload"
+DEFAULT_DATA_ROOT = "/home/xy/FRAM/Upload/Data to upload"
 DEFAULT_METADATA_DIR = DEFAULT_DATA_ROOT
 DEFAULT_README_FILE = None  # no shared README wired up yet for FRAM (open item)
 
@@ -123,6 +128,29 @@ HEALPIX_NSIDE = 64  # ~0.9 degree cell resolution; 49,152 total pixels
 CALIBRATION_IMAGETYPES = {"masterdark", "masterflat", "bias", "dcurrent"}
 
 SITE_CANDIDATES = ["auger2", "auger", "cta-n", "cta-s0", "cta-s1"]
+
+# Matches FRAM's per-day folder naming convention (e.g. "20220417") at any
+# depth under data_root, e.g. mnt/data3/cta-n/2022/20220417/03185/...
+# Used by discover_items()'s --date-pattern filtering to identify which
+# path component is the day-folder worth pruning against.
+DATE_DIR_RE = re.compile(r"^\d{8}$")
+
+# Env var fram_upload.py's own CLI wrapper (_run_via_bulk_async) sets from
+# --date-pattern, read here by discover_items() since bulk_async.py's
+# discover_items() call doesn't pass adapter-specific extra arguments (see
+# module docstring's discussion of the shared interface). Not set at all
+# means "no filtering, walk everything" -- the previous behavior.
+DATE_PATTERN_ENV_VAR = "FRAM_DATE_PATTERN"
+
+# Same mechanism as DATE_PATTERN_ENV_VAR, but for directory names to
+# always skip regardless of depth -- e.g. a "bad" folder some FRAM sites
+# use to quarantine known-bad frames that shouldn't be uploaded. Unlike
+# the date pattern, this is NOT limited to 8-digit day-folders; it prunes
+# any directory whose name matches, at any depth. Defaults to ["bad"] if
+# neither --exclude-dirs nor the env var is set; pass --exclude-dirs ""
+# explicitly to disable exclusion entirely.
+EXCLUDE_DIRS_ENV_VAR = "FRAM_EXCLUDE_DIRS"
+DEFAULT_EXCLUDE_DIRS = ["bad"]
 
 # Fields every record must have a usable value for, regardless of observation
 # type, since these drive read-time calibration association. NOTE: "target"
@@ -208,6 +236,36 @@ def _guess_site(path_str: str) -> str | None:
     return None
 
 
+def _parse_date_patterns() -> list[str] | None:
+    """Read FRAM_DATE_PATTERN (set by --date-pattern via the CLI wrapper
+    below) as a list of comma-separated glob patterns, e.g.
+    "202204*,202205*" -> ["202204*", "202205*"]. Returns None if the env
+    var is unset/empty, meaning "no date filtering -- walk everything"."""
+    raw = os.environ.get(DATE_PATTERN_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    patterns = [p.strip() for p in raw.split(",") if p.strip()]
+    return patterns or None
+
+
+def _parse_exclude_dirs() -> list[str]:
+    """Read FRAM_EXCLUDE_DIRS (set by --exclude-dirs via the CLI wrapper
+    below) as a list of comma-separated glob patterns matched against a
+    directory's NAME (not its full path) at any depth. If the env var was
+    never set at all, falls back to DEFAULT_EXCLUDE_DIRS (["bad"]). If it
+    WAS set but to an empty string (--exclude-dirs "" explicitly passed),
+    that's a deliberate opt-out -- returns an empty list, excluding
+    nothing."""
+    raw = os.environ.get(EXCLUDE_DIRS_ENV_VAR)
+    if raw is None:
+        return list(DEFAULT_EXCLUDE_DIRS)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _name_matches_any_pattern(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
 def discover_items(
     metadata_dir: Path, data_root: Path, readme_file: Path | None = None
 ) -> list[FramWorkItem]:
@@ -218,11 +276,50 @@ def discover_items(
 
     readme_file is likewise accepted but unused for now -- FRAM's
     per-experiment README referencing scheme is still an open item).
+
+    Two independent, os.walk-pruning filters (both read from env vars set
+    by fram_upload.py's own CLI wrapper -- see --date-pattern and
+    --exclude-dirs):
+
+    - Date filtering: any directory whose name looks like an 8-digit date
+      (matching DATE_DIR_RE, e.g. "20220417") and does NOT match at least
+      one of the --date-pattern glob patterns is skipped entirely. Applies
+      uniformly across every site under data_root (cta-n, auger2, ...),
+      since the pattern is matched against the day-folder name alone, not
+      the full path.
+    - Name exclusion: any directory whose name matches one of the
+      --exclude-dirs glob patterns (default: "bad") is skipped entirely,
+      at ANY depth -- not limited to day-folders.
+
+    Either filter pruning a directory means os.walk never descends into
+    it, so the (often enormous) set of files under a skipped directory is
+    never even touched -- this matters at FRAM's scale, where walking the
+    full tree just to discard most of it afterward would be very slow.
     """
+    date_patterns = _parse_date_patterns()
+    exclude_patterns = _parse_exclude_dirs()
+    if date_patterns:
+        logger.info("Date filter active: %s (only matching YYYYMMDD day-folders will be walked)", date_patterns)
+    if exclude_patterns:
+        logger.info("Directory exclusion active: %s (matching directories are skipped at any depth)", exclude_patterns)
+
     items: list[FramWorkItem] = []
     log_every = 50_000
     found = 0
-    for dirpath, _dirnames, filenames in os.walk(data_root):
+    pruned_dirs = 0
+    for dirpath, dirnames, filenames in os.walk(data_root):
+        if date_patterns or exclude_patterns:
+            kept = []
+            for name in dirnames:
+                if exclude_patterns and _name_matches_any_pattern(name, exclude_patterns):
+                    pruned_dirs += 1
+                    continue
+                if date_patterns and DATE_DIR_RE.match(name) and not _name_matches_any_pattern(name, date_patterns):
+                    pruned_dirs += 1
+                    continue
+                kept.append(name)
+            dirnames[:] = kept
+
         for name in filenames:
             if os.path.splitext(name)[1].lower() not in FITS_EXTENSIONS:
                 continue
@@ -232,6 +329,8 @@ def discover_items(
             found += 1
             if found % log_every == 0:
                 print(f"Discovery in progress: {found} FITS files found so far...")
+    if date_patterns or exclude_patterns:
+        logger.info("Filters pruned %s non-matching/excluded directory(ies) before descending into them.", pruned_dirs)
     items.sort(key=lambda it: it.key)
     return items
 
@@ -257,10 +356,12 @@ def _ra_to_lon(ra: float) -> float:
     return ra - 360.0 if ra > 180.0 else ra
 
 
-def _compute_footprint(wcs, usable_width: int, usable_height: int) -> dict | None:
+def _compute_footprint(
+    wcs, usable_width: int, usable_height: int, dec0: float, radius: float
+) -> dict | None:
     """
-    Return a GeoJSON Polygon object describing the image corners for
-    OpenSearch geo_shape indexing, with RA remapped to -180..+180 deg.
+    Return a GeoJSON shape describing the image footprint for OpenSearch
+    geo_shape indexing, with RA remapped to -180..+180 deg.
 
     Populates the `footprint` metadata field. The original PostgreSQL
     schema had this as a POLYGON type for geo search; here we use a GeoJSON
@@ -271,6 +372,28 @@ def _compute_footprint(wcs, usable_width: int, usable_height: int) -> dict | Non
     the short arc across the antimeridian rather than wrapping around the
     globe.
 
+    BUG FIX (celestial-pole case): images whose field of view contains a
+    celestial pole are a SEPARATE case from ordinary antimeridian-crossing.
+    Near a pole, the 4 corner longitudes spread across nearly the full
+    -180..+180 deg range (RA sweeps through all values over a tiny angular
+    distance on the sky), so the naive 4-point Polygon ring built below is
+    topologically invalid there regardless of `orientation` -- OpenSearch
+    rejects it with a `mapper_parsing_exception` /
+    "Unable to Tessellate shape. Possible malformed shape detected." error
+    (confirmed against real production records -- e.g.
+    20210901202536-251-RA.fits -- whose FOV contains the north celestial
+    pole; this previously made every such record fail to upload entirely).
+    In that case we instead emit a conservative bounding-box `envelope`
+    shape (full longitude range, latitude from the FOV's near edge to the
+    pole) -- verified to be accepted by OpenSearch's geo_shape mapping and
+    to match `intersects` queries the same way a Polygon would, which is
+    all the portal's cone-search round-2 containment check needs.
+
+    `dec0`/`radius` are the FOV center Dec and half-diagonal angular radius
+    (both already computed by the caller from the same WCS) -- a pole is
+    considered inside the FOV whenever the center is within `radius`
+    (great-circle distance) of it.
+
     Returns None on any WCS computation error.
     """
     try:
@@ -279,6 +402,16 @@ def _compute_footprint(wcs, usable_width: int, usable_height: int) -> dict | Non
         ras, decs = wcs.all_pix2world(px, py, 0)
 
         coords = [[_ra_to_lon(float(ra)), float(dec)] for ra, dec in zip(ras, decs)]
+
+        contains_north_pole = (90.0 - dec0) <= radius
+        contains_south_pole = (dec0 - (-90.0)) <= radius
+        if contains_north_pole or contains_south_pole:
+            corner_decs = [c[1] for c in coords]
+            if contains_north_pole:
+                lat_lo, lat_hi = min(corner_decs), 90.0
+            else:
+                lat_lo, lat_hi = -90.0, max(corner_decs)
+            return {"type": "envelope", "coordinates": [[-180.0, lat_hi], [180.0, lat_lo]]}
 
         lons = [c[0] for c in coords]
         crosses_antimeridian = (max(lons) - min(lons)) > 180.0
@@ -372,7 +505,11 @@ def extract_metadata(item: FramWorkItem) -> dict:
         healpix_idx = None
     else:
         center_geo = {"lat": dec0, "lon": _ra_to_lon(ra0)}
-        footprint = _compute_footprint(wcs, usable_width, usable_height) if wcs is not None else None
+        footprint = (
+            _compute_footprint(wcs, usable_width, usable_height, dec0, radius)
+            if wcs is not None
+            else None
+        )
         theta = np.radians(90.0 - dec0)  # HEALPix co-latitude
         phi = np.radians(ra0)
         healpix_idx = int(hp.ang2pix(HEALPIX_NSIDE, theta, phi))
@@ -391,9 +528,14 @@ def extract_metadata(item: FramWorkItem) -> dict:
         "type": obs_type,
         "filter": header.get("FILTER", "unknown"),
         "ccd": header.get("CCD_NAME"),
-        # Sourced from CCD_SER, not header['product_id'] -- see the KNOWN
-        # OPEN ITEM note at the top of this file.
-        "camera_serial": header.get("CCD_SER"),
+        # Sourced from PRODUCT_ID, matching calibrate.py's own internal
+        # find_calibration_config() lookup key -- see the KNOWN OPEN ITEM
+        # note at the top of this file for the remaining caveat this
+        # doesn't resolve (PRODUCT_ID's resolvability on the header object
+        # itself, not which field name to use).
+        "camera_serial": (
+            str(header["PRODUCT_ID"]) if header.get("PRODUCT_ID") is not None else None
+        ),
         "site": site,
         "ra0": ra0,
         "dec0": dec0,
@@ -464,8 +606,8 @@ def build_invenio_metadata(extracted: dict) -> dict:
                 }
             ],
             "identifiers": [{"identifier": "", "scheme": "url"}],
-            "related_resources": [{"title": "FRAM_2022_cta-n", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/s0as8-05q28", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
-                                  {"title": "FRAM", "identifiers": [{"identifier": "https://127.0.0.1:5000/fram/records/5xgdm-9ev77", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
+            "related_resources": [{"title": "FRAM_2024_auger", "identifiers": [{"identifier": "https://doi.org/10.83100/j3vr-c838", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+                                  {"title": "FRAM_FZU_root", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
             "subjects": [{"subject": s} for s in SUBJECTS],
             "rights": [{"id": "4-BY"}],
             "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
@@ -498,20 +640,41 @@ def build_invenio_metadata(extracted: dict) -> dict:
             "center_geo": extracted["center_geo"],
             "healpix_idx": extracted["healpix_idx"],
         },
-        "files": {"enabled": False},
+        "files": {"enabled": True},
         "access": {
             "record": "public",
-            "files": "restricted",
-            "embargo": {"active": "false", "reason": "null"},
+            "files": "public",
+            # Real Python types, not the string "false"/"null" this used to
+            # send. Confirmed against an actual published test1 record
+            # (hg8m6-w2179): Invenio coerced the string "false" into a real
+            # boolean false for "active" on its own, but "reason" stayed the
+            # literal string "null" rather than real JSON null -- sending
+            # native types here removes the dependency on that coercion
+            # happening at all, and fixes "reason" outright.
+            "embargo": {"active": False, "reason": None},
             "status": "restricted",
         },
-        # See FRAM_COMMUNITY above and the "COMMUNITY HANDLING" section of
-        # the module docstring. async_upload.py passes this through as
-        # client.records.create()'s community= keyword argument
-        # automatically.
-        # "community": FRAM_COMMUNITY,
-        "communities": [{"identifier": FRAM_COMMUNITY}
-    ]
+        # Passed through by async_upload.py as client.records.create()'s
+        # community= keyword argument -- see "COMMUNITY HANDLING" in the
+        # module docstring. This is the ONLY mechanism that actually works
+        # for FRAM: a top-level "communities" key on the record body (the
+        # previous approach here, "communities": [{"slug": FRAM_COMMUNITY}])
+        # is not a field Invenio's record schema recognizes at that level --
+        # community membership lives under parent.communities, which only
+        # community= (via nrp_cmd's own create()) actually populates.
+        # Confirmed by inspecting an actual published test1 record: sending
+        # the old "communities" key produced parent.communities == {} (no
+        # community at all), despite sending it.
+        "community": FRAM_COMMUNITY,
+        # Metadata-model routing kwarg, per Cesnet's own nrp_cmd usage
+        # example (client.records.create(metadata, model="particles")) --
+        # async_upload.py passes this through automatically as
+        # client.records.create()'s model= keyword argument whenever it's
+        # present. Confirmed working against a real test1 record (its
+        # "$schema" resolved server-side from this, matching
+        # DEFAULT_SCHEMA_URL, even with --disable-schema sending no
+        # "$schema" at all).
+        "model": "fram",
     }
 
 
@@ -573,6 +736,29 @@ def _extract_flag_value(argv: list[str], flag: str) -> str | None:
     return value
 
 
+def _strip_flag(argv: list[str], flag: str) -> list[str]:
+    """Return argv with every occurrence of `flag` (and its value, in
+    either "--flag value" or "--flag=value" form) removed. Needed for
+    FRAM-only flags (--date-pattern, --exclude-dirs) that bulk_async.py's
+    argparser doesn't know about -- forwarding them unstripped would make
+    it error out with "unrecognized arguments" before ever reaching
+    discover_items(), which is what actually consumes them (via env var,
+    set just below)."""
+    result: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == flag:
+            skip_next = True
+            continue
+        if arg.startswith(flag + "="):
+            continue
+        result.append(arg)
+    return result
+
+
 def _run_via_bulk_async() -> None:
     import importlib
     import sys
@@ -613,6 +799,31 @@ def _run_via_bulk_async() -> None:
     user_data_root = _extract_flag_value(sys.argv[1:], "--data-root")
     effective_data_root = user_data_root or DEFAULT_DATA_ROOT
 
+    # FRAM-only flags -- not part of bulk_async.py's generic argparser, so
+    # they're pulled out of sys.argv here (via env var, read by
+    # discover_items() in this module) and stripped before forwarding the
+    # rest to bulk_async.main(). See discover_items()'s docstring for what
+    # each actually does.
+    #
+    # --date-pattern "202204*,202205*": comma-separated glob patterns
+    # matched against YYYYMMDD day-folder names; only matching days are
+    # walked. Omit entirely to upload everything (previous behavior).
+    #
+    # --exclude-dirs "bad,other_name": comma-separated glob patterns
+    # matched against any directory NAME, at any depth, that should never
+    # be descended into. Defaults to "bad" if the flag is never passed at
+    # all; pass --exclude-dirs "" explicitly to disable exclusion.
+    argv_rest = sys.argv[1:]
+    date_pattern_value = _extract_flag_value(argv_rest, "--date-pattern")
+    if date_pattern_value is not None:
+        os.environ["FRAM_DATE_PATTERN"] = date_pattern_value
+        argv_rest = _strip_flag(argv_rest, "--date-pattern")
+
+    exclude_dirs_value = _extract_flag_value(argv_rest, "--exclude-dirs")
+    if exclude_dirs_value is not None:
+        os.environ["FRAM_EXCLUDE_DIRS"] = exclude_dirs_value
+        argv_rest = _strip_flag(argv_rest, "--exclude-dirs")
+
     default_flags = {
         "--adapter": ADAPTER_NAME,
         "--metadata-dir": effective_data_root,
@@ -625,14 +836,29 @@ def _run_via_bulk_async() -> None:
     for flag, value in default_flags.items():
         injected += [flag, value]
 
-    sys.argv = [sys.argv[0]] + injected + sys.argv[1:]
+    sys.argv = [sys.argv[0]] + injected + argv_rest
     bulk_async.main()
 
 
 if __name__ == "__main__":
     _run_via_bulk_async()
 
-
 #   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/[xyz]/Python WSL/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
+#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/Archive/v1/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4
+#
+# --date-pattern and --exclude-dirs are FRAM-only flags, hand-parsed out
+# of sys.argv by _run_via_bulk_async() above (via env var) rather than
+# registered with bulk_async.py's argparser -- they will NOT show up in
+# `python3 fram_upload.py --help`, only here and in discover_items()'s
+# docstring.
+#
+#   # Upload only April + May 2022 data, across every site under data_root:
+#   python3 fram_upload.py --environment test1 --data-root "..." --date-pattern "202204*,202205*"
+#
+#   # Default already skips any directory literally named "bad" at any depth;
+#   # add more names/patterns (comma-separated, replaces the default entirely):
+#   python3 fram_upload.py --environment test1 --data-root "..." --exclude-dirs "bad,quarantine,test_*"
+#
+#   # Explicitly disable exclusion (upload everything, including "bad" folders):
+#   python3 fram_upload.py --environment test1 --data-root "..." --exclude-dirs ""

@@ -68,13 +68,16 @@ import getpass
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import zipfile
+from collections import deque
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+import traceback
 
 from yarl import URL
 
@@ -322,6 +325,194 @@ async def _maybe_weighted_slot(limiter: "WeightedSemaphore | None", weight: int 
         yield
 
 
+# ============================================================
+# REQUEST-RATE LIMITER
+# (added after Cesnet confirmed test1's actual server-side rate limiter
+# config, via `invenio limiter limits`:
+#     Application Limits
+#     ├── 5000 per 1 hour
+#     └── 500 per 1 minute
+# Both apply SIMULTANEOUSLY (flask-limiter semantics -- a request must
+# pass every configured limit, not just one), so for any run lasting more
+# than a few minutes the 1-hour limit is the real bottleneck: 5000/3600 =
+# ~1.39 req/s sustained, well below the 500/60 = ~8.33 req/s the
+# per-minute limit alone would allow. A flat "N requests/second" limiter
+# would blow through the hourly budget in ~17 minutes and then get
+# rate-limited hard for the rest of the hour -- this needs to respect
+# BOTH windows at once, the same way the server does.
+#
+# This is a client-side, best-effort mirror of that config, not a
+# replacement for talking to Cesnet -- see bulk_async.py's --rate-limit
+# flag docs for the default safety margin below the reported numbers,
+# and the throughput-math note there about whether these limits (as
+# currently configured) are compatible with a 100 TB / multi-million-
+# record bulk run at all. Per Cesnet's own reply, the limiter can also be
+# temporarily disabled or reconfigured server-side for a known bulk job
+# (see the InvenioRDM ops docs on RATELIMIT_ENABLED) -- worth raising
+# with them directly rather than only working around it client-side.
+#
+# Every real HTTP call the client makes (records.create, files.upload,
+# the identifier-fill draft update, records.publish) should acquire()
+# immediately before firing, so the actual aggregate request rate leaving
+# this process never exceeds ANY configured limit, regardless of how many
+# concurrent upload tasks (--max-concurrency) are running.
+# ============================================================
+
+
+class RateLimiter:
+    """Enforces one or more (max_requests, window_seconds) constraints
+    simultaneously via a sliding-window request log -- e.g. limits=
+    [(500, 60), (5000, 3600)] mirrors "500 per minute AND 5000 per hour".
+
+    Deliberately conservative: uses a true sliding window (a request now
+    counts against every window it falls inside), not the server's exact
+    fixed-window bucket alignment, so it will never send more than
+    max_requests within any trailing window_seconds interval regardless
+    of where the server's own window boundaries happen to fall.
+
+    Shared across the whole run (one instance, passed to every upload
+    task) -- concurrency only affects how many tasks are waiting their
+    turn, not how fast requests actually leave the process.
+
+    acquire(weight=N) reserves N slots ATOMICALLY (all or nothing) rather
+    than requiring N separate acquire() calls. This matters specifically
+    for multipart file transfers: nrp_cmd fires every part of a multipart
+    upload concurrently via asyncio.TaskGroup (see
+    _expected_multipart_parts()'s docstring below) -- by the time any one
+    part's HTTP request actually starts, it's too late to pace them
+    individually from outside. Reserving the whole burst's worth of
+    capacity up front, before triggering the burst, is the only way this
+    limiter can actually account for what really happens on the wire.
+
+    Note on shutdown: acquire() can block for a long time if a window's
+    budget is exhausted (up to the full window_seconds in the worst
+    case). Consistent with this codebase's other blocking waits (the
+    weighted transfer semaphore, in-flight HTTP calls), a task already
+    inside acquire() will finish waiting before it next checks
+    stop_event -- shutdown here is cooperative, not preemptive.
+    """
+
+    def __init__(self, limits: list[tuple[int, float]]):
+        if not limits:
+            raise ValueError("RateLimiter needs at least one (max_requests, window_seconds) limit")
+        self.limits = list(limits)
+        self._events: dict[float, deque] = {window: deque() for _, window in self.limits}
+        self._lock = asyncio.Lock()
+
+    def _prune(self, now: float) -> None:
+        for _, window in self.limits:
+            dq = self._events[window]
+            cutoff = now - window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+    async def acquire(self, weight: int = 1) -> None:
+        weight = max(1, weight)
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._prune(now)
+                wait_needed = 0.0
+                impossible = False
+                for max_requests, window in self.limits:
+                    dq = self._events[window]
+                    if weight > max_requests:
+                        # This single burst can structurally never satisfy
+                        # this window on its own, no matter how empty it
+                        # is (e.g. a large multipart file needs more
+                        # concurrent parts than this window permits at
+                        # all). Waiting forever would just hang the run,
+                        # so: wait for the window to be as empty as
+                        # possible, then let it through anyway as a
+                        # best-effort exception, and say so.
+                        impossible = True
+                        if dq:
+                            wait_needed = max(wait_needed, dq[-1] + window - now)
+                        continue
+                    if len(dq) + weight > max_requests:
+                        overflow = len(dq) + weight - max_requests
+                        idx = overflow - 1
+                        if 0 <= idx < len(dq):
+                            wait_needed = max(wait_needed, dq[idx] + window - now)
+                if wait_needed <= 0:
+                    if impossible:
+                        logger.warning(
+                            "Rate-limit burst of weight=%s exceeds at least one configured "
+                            "window's own max_requests -- letting it through anyway (best "
+                            "effort) rather than blocking forever. Consider raising that "
+                            "window's limit, since a burst this large can't be paced under it.",
+                            weight,
+                        )
+                    for _, window in self.limits:
+                        for _ in range(weight):
+                            self._events[window].append(now)
+                    return
+            # Small epsilon avoids a tight busy-loop from floating-point
+            # rounding landing us just short of the window boundary.
+            await asyncio.sleep(wait_needed + 0.01)
+
+
+@asynccontextmanager
+async def _maybe_rate_limited(limiter: "RateLimiter | None", weight: int = 1):
+    if limiter is not None:
+        await limiter.acquire(weight=weight)
+    yield
+
+
+# ============================================================
+# MULTIPART BURST SIZE PREDICTION
+# (mirrors nrp_cmd's own async_client/connection/aws_limits.py
+# adjust_upload_multipart_params() -- specifically its "neither parts nor
+# part_size specified" case, which is how this codebase calls
+# client.files.upload(): we never pass either, so nrp_cmd always picks
+# the SMALLEST valid part size (50 MiB) to maximize part count, up to a
+# hard cap of 10,000 parts. Every part then uploads via a SEPARATE,
+# CONCURRENT HTTP PUT request (nrp_cmd's MultipartTransfer.upload() fires
+# them all via asyncio.TaskGroup, not one at a time) -- so a large file
+# isn't "a few extra requests spread out over time", it's a genuine burst
+# of N simultaneous requests the instant client.files.upload() is called,
+# entirely inside nrp_cmd and invisible to anything outside it.
+#
+# This means our own MULTIPART_THRESHOLD_BYTES (10 MB, used for the
+# separate transfer-weight budget above) is NOT the right signal for how
+# many real requests a file will generate -- nrp_cmd's actual minimum
+# part size is 50 MiB, so a file between 10-50MB is flagged "M" by our
+# own weighting but still only ever produces exactly 1 real request.
+# _expected_multipart_parts() below computes the REAL number directly
+# from file size, matching nrp_cmd's own arithmetic, rather than reusing
+# the existing MULTIPART_WEIGHT=5 flat multiplier (which is a reasonable
+# heuristic for the transfer-weight/concurrency budget's different
+# purpose, but not an accurate request-count for this one).
+# ============================================================
+
+AWS_MIN_UPLOAD_PART_SIZE_BYTES = 50 * 1024 * 1024  # 50 MiB
+AWS_MAX_UPLOAD_PART_SIZE_BYTES = 5 * 1024**3  # 5 GiB
+AWS_MAX_UPLOAD_PARTS = 10_000
+
+
+def _expected_multipart_parts(size_bytes: int) -> int:
+    """Predict how many concurrent PUT requests nrp_cmd will fire for a
+    multipart upload of this size, matching its own
+    adjust_upload_multipart_params() exactly for the no-hints-given case
+    (the only case this codebase ever triggers). Returns 1 for anything
+    that wouldn't actually be split into multiple parts (including
+    everything under nrp_cmd's own 50 MiB minimum part size, regardless
+    of whether our own MULTIPART_THRESHOLD_BYTES already classified it
+    as an "M" transfer for the separate transfer-weight budget)."""
+    if size_bytes <= 0:
+        return 1
+    max_parts_possible = math.ceil(size_bytes / AWS_MIN_UPLOAD_PART_SIZE_BYTES)
+    if max_parts_possible <= AWS_MAX_UPLOAD_PARTS:
+        return max(1, max_parts_possible)
+    # Only relevant for files large enough to need >10,000 parts even at
+    # the max 5 GiB part size (i.e. tens of terabytes) -- included for
+    # correctness/parity with nrp_cmd's own logic, not because FRAM's
+    # FITS files are expected to ever hit this branch.
+    chosen_part_size = math.ceil(size_bytes / AWS_MAX_UPLOAD_PARTS)
+    chosen_part_size = max(AWS_MIN_UPLOAD_PART_SIZE_BYTES, min(chosen_part_size, AWS_MAX_UPLOAD_PART_SIZE_BYTES))
+    return max(1, math.ceil(size_bytes / chosen_part_size))
+
+
 # Files at or above this size use a multipart ("M") transfer instead of a
 # single-shot local ("L") one, and count for MULTIPART_WEIGHT of the
 # shared transfer budget instead of 1. Matches the 10 MB threshold /
@@ -353,19 +544,39 @@ async def _upload_file_with_limiter(
     source: str,
     file_path: Path,
     limiter: "WeightedSemaphore | None" = None,
+    rate_limiter: "RateLimiter | None" = None,
 ):
     """Upload a single file with an explicit, size-based transfer_type
     (restored from the original Delphi script -- omitting transfer_type
     left it up to the client library's own default, which is suspected to
     be behind HTTP transfer errors on larger files) and, if a limiter is
     supplied, hold a weighted slot in the shared transfer budget for the
-    duration of the transfer."""
+    duration of the transfer. If rate_limiter is supplied, also reserves
+    enough rate-limit slots for however many concurrent PUT requests
+    nrp_cmd will actually fire for this transfer -- 1 for a normal ("L")
+    transfer, or _expected_multipart_parts(size) for a multipart ("M")
+    one, computed BEFORE the transfer starts (see RateLimiter.acquire()'s
+    docstring for why this has to be reserved atomically up front rather
+    than paced request-by-request)."""
     transfer_type = _transfer_type_for(file_path)
     weight = _transfer_weight_for(transfer_type)
+    rate_weight = 1
+    if transfer_type == "M":
+        try:
+            rate_weight = _expected_multipart_parts(file_path.stat().st_size)
+        except OSError:
+            rate_weight = 1
     async with _maybe_weighted_slot(limiter, weight):
-        return await client.files.upload(
-            record, key=key, metadata=metadata, source=source, transfer_type=transfer_type,
-        )
+        async with _maybe_rate_limited(rate_limiter, weight=rate_weight):
+            try:
+                tmp= await client.files.upload(record, key=key, metadata=metadata, source=source, transfer_type=transfer_type)
+            except ExceptionGroup as eg:
+                logger.warning(f"ExceptionGroup contains {len(eg.exceptions)} exceptions")
+                for i, exc in enumerate(eg.exceptions, start=1):
+                    logger.warning(f"\n--- Sub-exception {i} ---")
+                    logger.error("Something failed, woe", exc_info=True)
+                    raise exc
+        return tmp
 
 
 # ============================================================
@@ -523,9 +734,11 @@ async def upload_record_async(
     validate: bool = True,
     schema_url: str | None = None,
     upload_limiter: "WeightedSemaphore | None" = None,
+    rate_limiter: "RateLimiter | None" = None,
     file_concurrency: int = 1,
     attempt: int = 1,
     max_attempts: int = 1,
+    disable_schema: bool = False,
 ) -> object | None:
     """
     Full pipeline for a single record: extract -> validate -> build
@@ -557,6 +770,17 @@ async def upload_record_async(
     goes through the shared, global upload_limiter regardless of this
     value, so file_concurrency only affects how many of *this record's*
     files can be waiting on that shared limiter simultaneously.
+
+    disable_schema omits "$schema" from the record payload entirely
+    (schema_url / adapter.DEFAULT_SCHEMA_URL are simply not computed or
+    sent) rather than sending a value that may be wrong for the target
+    deployment -- some repository configs route/validate a record purely
+    from "model"/"community" (see the COMMUNITY/WORKFLOW/MODEL docstring
+    section above) without needing an explicit "$schema" at all; per
+    Cesnet's own nrp_cmd usage example, records.create() is called with
+    just metadata + model=, no "$schema" key. Use this when you're not
+    yet sure the configured DEFAULT_SCHEMA_URL is correct for the
+    environment you're uploading to.
     """
     if adapter is None:
         raise RuntimeError(
@@ -591,7 +815,7 @@ async def upload_record_async(
                 return None
 
         metadata = adapter.build_invenio_metadata(extracted)
-        record_schema_url = schema_url or adapter.DEFAULT_SCHEMA_URL
+        record_schema_url = None if disable_schema else (schema_url or adapter.DEFAULT_SCHEMA_URL)
 
         if dry_run:
             status = "dryrun"
@@ -613,8 +837,9 @@ async def upload_record_async(
             "metadata": metadata["metadata"],
             "access": metadata["access"],
             "files": metadata["files"],
-            "$schema": record_schema_url,
         }
+        if not disable_schema:
+            record_payload["$schema"] = record_schema_url
         # Only some adapters set "communities" (e.g. SiPM does, ITk
         # doesn't) -- omit the key entirely rather than sending a null
         # value when an adapter's build_invenio_metadata() doesn't
@@ -640,7 +865,8 @@ async def upload_record_async(
         if metadata.get("model"):
             create_kwargs["model"] = metadata["model"]
 
-        record = await client.records.create(record_payload, **create_kwargs)
+        async with _maybe_rate_limited(rate_limiter):
+            record = await client.records.create(record_payload, **create_kwargs)
         logger.info("[%s] Created draft: %s", item.key, record.id)
 
         # Self-referential URL identifier: Physics-repository records
@@ -661,7 +887,8 @@ async def upload_record_async(
                     ident["identifier"] = str(record.links.self_html)
                     filled = True
             if filled:
-                record = await client.records.draft_records.update(record)
+                async with _maybe_rate_limited(rate_limiter):
+                    record = await client.records.draft_records.update(record)
                 logger.info(
                     "[%s] Filled self-URL identifier, now at revision: %s",
                     item.key, getattr(record, "revision_id", None),
@@ -681,6 +908,7 @@ async def upload_record_async(
                     source=str(file_path),
                     file_path=file_path,
                     limiter=upload_limiter,
+                    rate_limiter=rate_limiter,
                 )
             logger.info("[%s] Uploaded: %s", item.key, file_.key)
             return file_path.stat().st_size
@@ -691,7 +919,38 @@ async def upload_record_async(
         bytes_uploaded += sum(upload_sizes)
         file_count += len(upload_files)
 
-        published = await client.records.publish(record)
+        if create_kwargs.get("community"):
+            # CESNET-recommended workaround for nrp-cmd 1.0.0: when create()
+            # is called with community=..., it internally PUTs a
+            # "community-submission" review request to the draft's /review
+            # endpoint AFTER it already fetched the Record object it
+            # returns -- so record.expanded["requests"] on that object is
+            # stale (snapshotted before that PUT). Refetching right here,
+            # immediately before publish(), rather than right after
+            # create(), matters because any intervening record-mutating
+            # call (e.g. the identifiers PUT above via
+            # client.records.draft_records.update()) returns yet another
+            # Record object whose "expanded" key nrp_cmd's plain update()
+            # never populates at all (no expand=1 on that PUT) -- so a
+            # refresh done only right after create() gets silently
+            # overwritten by such a call, reproducing the same failure as
+            # a bare KeyError("requests") inside publish()/_request_op()
+            # instead of the original ValueError. A fresh read() here
+            # (nrp_cmd's read() always requests expand=1) picks up the
+            # request that publish() below needs in order to find the
+            # applicable "community-submission" request instead of falling
+            # back to the inapplicable "publish_draft". Confirmed by
+            # CESNET (Mirek Simek) as the correct workaround while a
+            # proper library-side fix is pending.
+            async with _maybe_rate_limited(rate_limiter):
+                record = await client.records.read(record.links.self_)
+            logger.info(
+                "[%s] Refreshed draft after community submission: %s",
+                item.key, record.id,
+            )
+
+        async with _maybe_rate_limited(rate_limiter):
+            published = await client.records.publish(record)
         logger.info("[%s] Published: %s", item.key, published.id)
 
     except Exception as exc:
@@ -763,6 +1022,7 @@ async def main_async(adapter_name: str | None = None) -> None:
         item=items[0],
         stats_path=Path("upload_stats.csv"),
         upload_limiter=WeightedSemaphore(50),
+        rate_limiter=RateLimiter([(450, 60), (4500, 3600)]),
     )
 
 

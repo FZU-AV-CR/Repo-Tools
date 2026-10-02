@@ -53,7 +53,7 @@ from pathlib import Path
 
 import adapters
 import async_upload
-from async_upload import WeightedSemaphore
+from async_upload import WeightedSemaphore, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ TERMINAL_STATUSES = {"ok", "failed", "skipped_invalid", "dryrun"}
 # ============================================================
 
 
-def _scan_stats(stats_path: Path) -> tuple[set[str], set[str]]:
+def _scan_stats(stats_path: "Path | None") -> tuple[set[str], set[str]]:
     """Return (uploaded_keys, interrupted_keys).
 
     uploaded_keys: keys with a terminal status == 'ok' -- safe to skip on
@@ -79,8 +79,11 @@ def _scan_stats(stats_path: Path) -> tuple[set[str], set[str]]:
     deduplicate against the repository itself), but are surfaced as a
     startup warning so they can be checked manually if duplicates are a
     concern.
+
+    stats_path=None (--disable-stats) means no persistent record exists at
+    all -- resume/dedup is impossible, so this always returns empty sets.
     """
-    if not stats_path.exists():
+    if stats_path is None or not stats_path.exists():
         return set(), set()
 
     started: set[str] = set()
@@ -109,7 +112,7 @@ def _scan_stats(stats_path: Path) -> tuple[set[str], set[str]]:
     return uploaded, interrupted
 
 
-def _final_rows_per_key(stats_path: Path) -> dict[str, dict]:
+def _final_rows_per_key(stats_path: "Path | None") -> dict[str, dict]:
     """Return the LAST non-'started' stats row seen for each key, as a
     dict of key -> row dict.
 
@@ -122,7 +125,7 @@ def _final_rows_per_key(stats_path: Path) -> dict[str, dict]:
     final outcome (across this run and any prior resumed runs), so a
     plain dict keyed by `key` naturally ends up holding exactly that.
     """
-    if not stats_path.exists():
+    if stats_path is None or not stats_path.exists():
         return {}
     final: dict[str, dict] = {}
     try:
@@ -138,6 +141,92 @@ def _final_rows_per_key(stats_path: Path) -> dict[str, dict]:
         logger.warning("Failed to parse stats file %s: %s", stats_path, exc)
         return {}
     return final
+
+
+def _estimate_requests_for_row(row: dict) -> int:
+    """Conservative estimate of how many real HTTP requests a single stats
+    CSV row's attempt consumed, used only for seeding the rate limiter's
+    history on process startup (see RateLimiter.seed_from_history() and
+    _reconstruct_rate_limiter_history() below). Deliberately errs toward
+    OVERestimating rather than underestimating: this value only controls
+    how cautiously a resumed/restarted process starts out, and
+    underestimating risks recreating the exact retry storm this
+    reconstruction exists to prevent, while overestimating only costs a
+    somewhat more conservative startup pace.
+
+    "started" rows are not counted here at all (return 0) -- they exist to
+    detect crashes (see _scan_stats()'s "interrupted" keys), and every
+    attempt that reached a real terminal status also has its own terminal
+    row; counting both would double-count the same underlying attempt.
+    A "started" row with no matching terminal row (a genuinely interrupted
+    attempt) is undercounted by this simplification -- accepted as a minor
+    gap for what's already an approximation, and such rows are already
+    surfaced separately as a startup warning elsewhere.
+    """
+    status = str(row.get("status", "")).strip().lower()
+    if status == "started":
+        return 0
+    requests = 1  # records.create()
+    try:
+        bytes_uploaded = int(float(row.get("bytes_uploaded") or 0))
+    except (TypeError, ValueError):
+        bytes_uploaded = 0
+    if bytes_uploaded > 0:
+        # Mirrors async_upload.py's own multipart-burst weighting exactly,
+        # so a large historical file's real request footprint is reflected
+        # here the same way it would be if that upload were happening now.
+        requests += async_upload._expected_multipart_parts(bytes_uploaded)
+    if status == "ok":
+        requests += 1  # records.publish()
+    return requests
+
+
+def _reconstruct_rate_limiter_history(stats_path: "Path | None", rate_limiter: "RateLimiter | None") -> tuple[int, int]:
+    """Seed rate_limiter's sliding-window history from stats_path's past
+    attempts, so a freshly started process (after a crash, a manual
+    restart, or a new pass launched by fram_upload_with_retry.py) doesn't
+    forget how much of the server's real, shared rate-limit budget was
+    already consumed recently -- the server's own window doesn't reset
+    just because our client did. See RateLimiter.seed_from_history()'s
+    docstring for the full rationale.
+
+    Returns (rows_scanned, total_weight_seeded), both 0 if there's nothing
+    to seed from (no stats file yet, no rate limiter configured, or
+    nothing recent enough to matter).
+    """
+    if stats_path is None or rate_limiter is None or not stats_path.exists():
+        return 0, 0
+
+    max_window = max(window for _, window in rate_limiter.limits)
+    now = time.time()
+    cutoff = now - max_window
+
+    events: list[tuple[float, int]] = []
+    rows_scanned = 0
+    try:
+        with stats_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                start_ts_raw = row.get("start_ts")
+                if not start_ts_raw:
+                    continue
+                try:
+                    start_ts = float(start_ts_raw)
+                except (TypeError, ValueError):
+                    continue
+                if start_ts < cutoff:
+                    continue
+                weight = _estimate_requests_for_row(row)
+                if weight <= 0:
+                    continue
+                events.append((start_ts, weight))
+                rows_scanned += 1
+    except Exception as exc:
+        logger.warning("Failed to parse stats file %s for rate-limit history reconstruction: %s", stats_path, exc)
+        return 0, 0
+
+    seeded = rate_limiter.seed_from_history(events)
+    return rows_scanned, seeded
 
 
 def summarize_final_outcomes(stats_path: Path) -> dict[str, list[str]]:
@@ -376,7 +465,7 @@ class ProgressTracker:
 # ============================================================
 
 
-async def _write_skip_stats(stats_path: Path, stats_format: str, key: str, reason: str) -> None:
+async def _write_skip_stats(stats_path: "Path | None", stats_format: str, key: str, reason: str) -> None:
     """Write a visible stats row for an item that was never attempted
     because the circuit breaker had tripped or shutdown was requested.
 
@@ -415,7 +504,7 @@ def _request_shutdown(stop_event: asyncio.Event, sig) -> None:
 async def _upload_with_retries(
     client,
     item,
-    stats_path: Path,
+    stats_path: "Path | None",
     stats_format: str,
     schema_url: str,
     dry_run: bool,
@@ -424,7 +513,9 @@ async def _upload_with_retries(
     retries: int = 3,
     delay: int = 2,
     upload_limiter: WeightedSemaphore | None = None,
+    rate_limiter: RateLimiter | None = None,
     file_concurrency: int = 1,
+    disable_schema: bool = False,
 ):
     retries = max(1, retries)
     last_exc: Exception | None = None
@@ -442,7 +533,9 @@ async def _upload_with_retries(
                 validate=validate,
                 schema_url=schema_url,
                 upload_limiter=upload_limiter,
+                rate_limiter=rate_limiter,
                 file_concurrency=file_concurrency,
+                disable_schema=disable_schema,
                 attempt=attempt,
                 max_attempts=retries,
             )
@@ -461,7 +554,81 @@ async def _upload_with_retries(
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    async_upload.setup_logging(log_file=Path(args.log_file) if args.log_file else None)
+    # Resolve default output locations before anything else logs or writes
+    # anything, since setup_logging() (in _main_async_inner) needs the
+    # final log_file path.
+    #
+    # Default (neither --stats-path nor --log-file given): write both into
+    # a fresh cwd/logs/<run_id>/ folder, so repeated runs don't clobber
+    # each other's logs/stats and don't need manual cleanup between test
+    # runs. --run-id pins this to a stable, reusable folder name (e.g. for
+    # a run you intend to resume/restart against the SAME stats file);
+    # without it, a fresh timestamp is used every run, which means
+    # resume/dedup will NOT work by default across separate invocations --
+    # pass --stats-path explicitly (or use --run-id) if you need that.
+    #
+    # --disable-stats / --disable-logs independently suppress the stats
+    # CSV / log file entirely (console output only, no resume capability)
+    # -- meant for quick manual testing, where a leftover upload_stats.csv
+    # you have to keep deleting between runs gets in the way. An explicit
+    # --stats-path/--log-file always wins over these defaults regardless.
+    run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+    default_run_dir = Path.cwd() / "logs" / run_id
+
+    if args.disable_stats:
+        stats_path = None
+    elif args.stats_path:
+        stats_path = Path(args.stats_path)
+    else:
+        stats_path = default_run_dir / "upload_stats.csv"
+
+    if args.disable_logs:
+        log_file = None
+    elif args.log_file:
+        log_file = Path(args.log_file)
+    else:
+        log_file = default_run_dir / "upload.log"
+
+    # The actual work happens in _main_async_inner. Wrapping it here (rather
+    # than folding this try/finally into that function directly) means the
+    # run id / stats path / log file get announced again as the LAST thing
+    # logged no matter how the run ends: normal completion, an early
+    # validation failure (return), a graceful Ctrl-C drain (the stop_event
+    # mechanism further down doesn't raise, so it would already reach this
+    # point naturally), or a raw KeyboardInterrupt/exception from somewhere
+    # that isn't covered by that graceful path at all (e.g. interrupting an
+    # interactive token prompt, or discover_items() taking a long time) --
+    # this finally still fires regardless. Without this, checking only the
+    # tail of a long log after an interrupt could leave you unable to find
+    # which --run-id to reuse to resume, since it was otherwise only ever
+    # logged once, near the very top of the file.
+    try:
+        await _main_async_inner(args, run_id, stats_path, log_file)
+    finally:
+        logger.warning(
+            "Run id: %s | Stats CSV: %s | Log file: %s -- reuse this --run-id "
+            "(or --stats-path) to resume this run later, regardless of how it just ended.",
+            run_id, stats_path, log_file,
+        )
+
+
+async def _main_async_inner(
+    args: argparse.Namespace, run_id: str, stats_path: "Path | None", log_file: "Path | None"
+) -> None:
+    async_upload.setup_logging(log_file=log_file)
+
+    if args.disable_stats:
+        logger.warning(
+            "Stats CSV DISABLED (--disable-stats) -- no upload_stats.csv will be written, "
+            "resume/dedup is impossible, and the end-of-run failure summary will be skipped. "
+            "Intended for quick manual testing only -- do not use this for a real bulk run."
+        )
+    else:
+        logger.info("Stats CSV: %s", stats_path)
+    if args.disable_logs:
+        logger.warning("Log file DISABLED (--disable-logs) -- console output only.")
+    else:
+        logger.info("Log file: %s", log_file)
 
     # Resolve + configure the metadata-model adapter (--adapter flag ->
     # PHYSICS_ADAPTER env var -> error). async_upload.configure_adapter()
@@ -469,6 +636,10 @@ async def main_async(args: argparse.Namespace) -> None:
     # upload_record_async()) and returns the same module here for local use.
     adapter = async_upload.configure_adapter(args.adapter)
     schema_url = args.schema_url or adapter.DEFAULT_SCHEMA_URL
+    # Schema is DISABLED by default (see --enable-schema's help text for
+    # why) -- args.disable_schema is accepted but has no effect anymore,
+    # kept only for backward compatibility with existing command lines.
+    effective_disable_schema = not args.enable_schema
 
     if args.token:
         logger.warning(
@@ -481,7 +652,6 @@ async def main_async(args: argparse.Namespace) -> None:
     metadata_dir = Path(args.metadata_dir)
     data_root = Path(args.data_root)
     readme_file = Path(args.readme_file) if args.readme_file else None
-    stats_path = Path(args.stats_path)
 
     if not metadata_dir.exists():
         logger.error("Metadata directory does not exist: %s", metadata_dir)
@@ -528,16 +698,6 @@ async def main_async(args: argparse.Namespace) -> None:
             len(interrupted_keys), sample, " ..." if len(interrupted_keys) > 20 else "",
         )
 
-    logger.info(
-        "Items to upload: %s (adapter=%s, environment=%s, max_concurrency=%s, "
-        "transfer_weight_budget=%s, file_concurrency=%s, breaker=[window=%ss min_samples=%s "
-        "failure_threshold=%.0f%% cooldown=%ss half_open_probes=%s], dry_run=%s)",
-        len(items), adapter.__name__, args.environment, args.max_concurrency,
-        args.transfer_weight_budget, args.file_concurrency,
-        args.breaker_window_seconds, args.breaker_min_samples, args.breaker_failure_threshold * 100,
-        args.breaker_cooldown_seconds, args.breaker_half_open_probes, args.dry_run,
-    )
-
     sem = asyncio.Semaphore(args.max_concurrency)
     # Bounds total in-flight *transfer weight* (large/multipart uploads
     # count for more than small/direct ones -- see async_upload.py's
@@ -551,14 +711,101 @@ async def main_async(args: argparse.Namespace) -> None:
     # Cesnet rather than guessing, especially before scaling up
     # --max-concurrency for the full 100 TB run.
     upload_limiter = WeightedSemaphore(args.transfer_weight_budget)
-    breaker = CircuitBreaker(
-        window_seconds=args.breaker_window_seconds,
-        min_samples=args.breaker_min_samples,
-        failure_threshold=args.breaker_failure_threshold,
-        cooldown_seconds=args.breaker_cooldown_seconds,
-        half_open_max_probes=args.breaker_half_open_probes,
-        half_open_success_threshold=args.breaker_half_open_success_threshold,
+
+    # Global requests-per-second limiter -- see async_upload.py's
+    # RateLimiter docstring. Defaults mirror Cesnet's actual reported
+    # test1 config (500/min, 5000/hour) with a ~10% safety margin, since
+    # the limiter is very likely shared with other traffic hitting the
+    # same server and running right up against the exact configured
+    # numbers leaves no room for that. Each --rate-limit "N/seconds" is
+    # enforced simultaneously with every other one supplied (AND, not OR)
+    # -- pass the flag multiple times for multiple windows, matching
+    # flask-limiter's own semantics.
+    if args.disable_rate_limit:
+        rate_limiter = None
+        rate_limit_specs = "disabled"
+        logger.warning(
+            "Rate limiting explicitly DISABLED (--disable-rate-limit) -- every real HTTP request "
+            "(create, upload, publish) fires with no client-side pacing at all. Only use this once "
+            "you've confirmed test1/production genuinely has no active server-side rate limiter -- "
+            "if one is later re-enabled without you knowing, this flag being left on will reproduce "
+            "the exact 429/retry-storm behavior this limiter exists to prevent."
+        )
+    else:
+        rate_limit_specs = args.rate_limit if args.rate_limit is not None else ["450/60", "4500/3600"]
+        rate_limits: list[tuple[int, float]] = []
+        for spec in rate_limit_specs:
+            try:
+                count_str, window_str = spec.split("/", 1)
+                rate_limits.append((int(count_str), float(window_str)))
+            except (ValueError, AttributeError):
+                logger.error(
+                    "Invalid --rate-limit value %r -- expected 'N/seconds', e.g. '450/60'. Ignoring it.",
+                    spec,
+                )
+        rate_limiter = RateLimiter(rate_limits) if rate_limits else None
+        if rate_limiter is None:
+            logger.warning(
+                "No valid --rate-limit values parsed -- request-rate limiting is DISABLED. "
+                "Given test1's server-side limiter (500/min, 5000/hour per Cesnet), running "
+                "without this is likely to hit 429s, especially at higher --max-concurrency. "
+                "If this is intentional, use --disable-rate-limit instead for a clearer signal."
+            )
+
+    # History reconstruction only makes sense when a real limiter exists --
+    # whether it's absent because of --disable-rate-limit or because no
+    # valid --rate-limit values were parsed makes no difference here.
+    if rate_limiter is not None:
+        if args.disable_rate_limit_history:
+            logger.warning(
+                "Rate-limit history reconstruction DISABLED (--disable-rate-limit-history) -- "
+                "this process's rate limiter starts believing the FULL budget is available, even "
+                "if a previous process (a prior pass, or a crashed/restarted run) already used up "
+                "some of the server's real, shared window recently. Risks a burst of 429s right "
+                "after startup if that's the case."
+            )
+        else:
+            rows_scanned, seeded_weight = _reconstruct_rate_limiter_history(stats_path, rate_limiter)
+            if seeded_weight > 0:
+                logger.info(
+                    "Rate-limit history: reconstructed ~%s request(s) worth of recent activity from "
+                    "%s row(s) in %s (within the last %.0fs) -- rate limiter starting with reduced "
+                    "budget to reflect what the server likely still remembers, not a fresh full quota.",
+                    seeded_weight, rows_scanned, stats_path, max(window for _, window in rate_limiter.limits),
+                )
+
+    breaker = None
+    if not args.disable_breaker:
+        breaker = CircuitBreaker(
+            window_seconds=args.breaker_window_seconds,
+            min_samples=args.breaker_min_samples,
+            failure_threshold=args.breaker_failure_threshold,
+            cooldown_seconds=args.breaker_cooldown_seconds,
+            half_open_max_probes=args.breaker_half_open_probes,
+            half_open_success_threshold=args.breaker_half_open_success_threshold,
+        )
+    else:
+        logger.warning(
+            "Circuit breaker DISABLED (--disable-breaker) -- every item will be attempted "
+            "regardless of how many prior uploads failed. Useful for isolating whether errors "
+            "are breaker-related, but means a systemic problem will not stop the run early."
+        )
+
+    logger.info(
+        "Items to upload: %s (adapter=%s, environment=%s, max_concurrency=%s, "
+        "transfer_weight_budget=%s, file_concurrency=%s, rate_limits=%s, "
+        "schema=%s, breaker=%s, dry_run=%s)",
+        len(items), adapter.__name__, args.environment, args.max_concurrency,
+        args.transfer_weight_budget, args.file_concurrency, rate_limit_specs,
+        "DISABLED (default -- pass --enable-schema to send $schema)" if effective_disable_schema else schema_url,
+        "disabled" if breaker is None else (
+            f"[window={args.breaker_window_seconds}s min_samples={args.breaker_min_samples} "
+            f"failure_threshold={args.breaker_failure_threshold * 100:.0f}% "
+            f"cooldown={args.breaker_cooldown_seconds}s half_open_probes={args.breaker_half_open_probes}]"
+        ),
+        args.dry_run,
     )
+
     progress = ProgressTracker(total=len(items), interval=args.progress_interval)
     stop_event = asyncio.Event()
 
@@ -574,7 +821,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     async def _run_one(item):
         async with sem:
-            if stop_event.is_set() or not await breaker.allow_start():
+            breaker_blocked = breaker is not None and not await breaker.allow_start()
+            if stop_event.is_set() or breaker_blocked:
                 reason = "shutdown" if stop_event.is_set() else "breaker"
                 logger.info("[%s] Skipping (shutdown requested or circuit breaker open)", item.key)
                 progress.record("skipped")
@@ -594,13 +842,17 @@ async def main_async(args: argparse.Namespace) -> None:
                     retries=args.max_retries,
                     delay=args.retry_delay,
                     upload_limiter=upload_limiter,
+                    rate_limiter=rate_limiter,
                     file_concurrency=args.file_concurrency,
+                    disable_schema=effective_disable_schema,
                 )
-                await breaker.record_result(success=True)
+                if breaker is not None:
+                    await breaker.record_result(success=True)
                 progress.record("ok" if result is not None else "skipped")
                 return result
             except Exception as exc:
-                await breaker.record_result(success=False)
+                if breaker is not None:
+                    await breaker.record_result(success=False)
                 progress.record("failed")
                 return exc
 
@@ -614,14 +866,14 @@ async def main_async(args: argparse.Namespace) -> None:
             pass
 
     logger.info(
-        "%s finished in %.2fs. total=%s ok=%s failed=%s skipped=%s (see %s for full per-item status)",
+        "%s finished in %.2fs. total=%s ok=%s failed=%s skipped=%s%s",
         "Dry run" if args.dry_run else "Bulk upload",
         time.perf_counter() - start,
         progress.done, progress.ok, progress.failed, progress.skipped,
-        stats_path,
+        f" (see {stats_path} for full per-item status)" if stats_path is not None else " (--disable-stats was set, no per-item record was kept)",
     )
 
-    if not args.dry_run:
+    if not args.dry_run and stats_path is not None:
         # progress.failed/progress.ok above count *attempts*, not items --
         # a key retried twice before succeeding counts as 1 failed + 1 ok
         # there. This resolves each key to its true final outcome (see
@@ -652,6 +904,13 @@ async def main_async(args: argparse.Namespace) -> None:
             )
         if not failed_keys and not skipped_breaker and not skipped_shutdown:
             logger.info("No failed or breaker/shutdown-skipped items in %s.", stats_path)
+    elif not args.dry_run and stats_path is None:
+        logger.warning(
+            "Stats CSV was disabled (--disable-stats) -- no failure summary is available. "
+            "progress totals above (ok=%s failed=%s skipped=%s) count attempts, not resolved "
+            "items, and any per-item error detail was only ever sent to the log/console.",
+            progress.ok, progress.failed, progress.skipped,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -673,8 +932,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stats-path",
-        default="upload_stats.csv",
-        help="Path to the stats CSV (also used for resume)",
+        default=None,
+        help="Path to the stats CSV (also used for resume). Defaults to "
+             "<cwd>/logs/<run-id>/upload_stats.csv if omitted -- see --run-id and --disable-stats.",
+    )
+    parser.add_argument(
+        "--run-id", default=None,
+        help="Stable name for this run's default output folder (<cwd>/logs/<run-id>/), used only "
+             "when --stats-path/--log-file are omitted. Without it, a fresh timestamp is used every "
+             "run, so restarting without --run-id or an explicit --stats-path will NOT resume from a "
+             "previous run's progress -- pass a fixed --run-id (or --stats-path) for a run you intend "
+             "to restart/resume.",
+    )
+    parser.add_argument(
+        "--disable-stats", action="store_true",
+        help="Do not write a stats CSV at all -- no resume/dedup, no end-of-run failure summary. "
+             "For quick manual testing only; do not use for a real bulk run.",
+    )
+    parser.add_argument(
+        "--disable-logs", action="store_true",
+        help="Do not write a log file -- console output only. For quick manual testing only.",
     )
     parser.add_argument("--max-concurrency", type=int, default=4, help="Maximum concurrent uploads")
     parser.add_argument(
@@ -694,13 +971,62 @@ def parse_args() -> argparse.Namespace:
              "(e.g. FRAM); relevant for adapters with several files per record (e.g. Delphi).",
     )
     parser.add_argument(
+        "--disable-rate-limit", action="store_true",
+        help="Disable client-side request-rate limiting entirely (--rate-limit and its defaults are "
+             "both ignored). Only use this once you've confirmed the target environment genuinely has "
+             "no active server-side rate limiter -- if one exists (or is re-enabled later) without you "
+             "knowing, running with this flag reproduces the exact 429/retry-storm behavior the rate "
+             "limiter exists to prevent. Confirming via response headers is unreliable: a server can "
+             "enforce a limit while never sending headers about it either way -- ask the repository "
+             "operator directly if you're not certain.",
+    )
+    parser.add_argument(
+        "--rate-limit", action="append", default=None,
+        help="Global request-rate limit as 'N/seconds', e.g. '450/60' = at most 450 requests in any "
+             "60s window. Repeat the flag for multiple simultaneous windows (all are enforced together, "
+             "AND not OR) -- the default mirrors Cesnet's reported test1 server-side limiter config "
+             "(500/min, 5000/hour) with a ~10%% safety margin: '--rate-limit 450/60 --rate-limit "
+             "4500/3600'. For a long-running bulk job the longer window is usually the real bottleneck "
+             "(4500/3600 = ~1.25 req/s sustained, well under the 450/60 = ~7.5 req/s the per-minute "
+             "window alone would allow) -- confirm with Cesnet whether this can be raised or scoped to "
+             "this job specifically before assuming --max-concurrency is what limits your throughput. "
+             "Pass an empty value or omit entirely with caution -- see the warning logged at startup "
+             "if no rate limit ends up configured.",
+    )
+    parser.add_argument(
+        "--disable-rate-limit-history", action="store_true",
+        help="On startup, this process normally scans --stats-path for recent activity (within the "
+             "largest configured --rate-limit window) and seeds the rate limiter with an estimate of "
+             "what it already consumed -- since restarting the client (a crash, a manual resume, or "
+             "each pass of fram_upload_with_retry.py launching a fresh process) does not reset the "
+             "SERVER's own window; it only forgets our own bookkeeping. Without this reconstruction, "
+             "a resumed run believes the full rate-limit budget is available immediately, which can "
+             "recreate the exact 429 burst the limiter exists to prevent. Pass this flag to disable "
+             "that reconstruction and start with a fresh, full budget regardless of recent history "
+             "(e.g. if --stats-path points at an old, unrelated file).",
+    )
+    parser.add_argument(
         "--environment", choices=sorted(async_upload.ENVIRONMENTS), default="local",
         help="Which repository to upload to (local / test1 / production)",
     )
     parser.add_argument(
         "--schema-url", default=None,
         help="Invenio $schema value; defaults to the selected adapter's own DEFAULT_SCHEMA_URL if omitted. "
-             "Confirmed only for local so far -- verify before using with test1/production.",
+             "Confirmed only for local so far -- verify before using with test1/production. Ignored "
+             "entirely unless --enable-schema is set (schema is DISABLED by default -- see --enable-schema).",
+    )
+    parser.add_argument(
+        "--disable-schema", action="store_true",
+        help="No longer does anything -- omitting \"$schema\" is now the DEFAULT. Kept only so an "
+             "existing command line that already includes this flag keeps working unchanged. Use "
+             "--enable-schema to opt back into sending \"$schema\".",
+    )
+    parser.add_argument(
+        "--enable-schema", action="store_true",
+        help="Send \"$schema\" in the record payload (the old default behavior), instead of omitting "
+             "it. Confirmed unnecessary for FRAM/test1: an actual published record resolved the correct "
+             "\"$schema\" server-side purely from model=, even with no \"$schema\" sent at all. Only "
+             "use this if a different adapter/environment turns out to actually need an explicit value.",
     )
     parser.add_argument(
         "--token", default=None,
@@ -712,6 +1038,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Extract & validate metadata but do not create/upload/publish any records")
     parser.add_argument("--no-validate", action="store_true", help="Disable the minimal required-field check before upload")
+    parser.add_argument(
+        "--disable-breaker", action="store_true",
+        help="Disable the circuit breaker entirely -- every item is attempted regardless of how many "
+             "prior uploads failed (no rate-based tripping, no cooldown/half-open skipping). Useful for "
+             "isolating whether errors you're seeing are caused by the breaker itself vs. something "
+             "else (e.g. transport/rate-limit issues) -- NOT recommended for a real bulk run, since a "
+             "systemic problem will then run to completion (or exhaust retries on every item) instead "
+             "of pausing early.",
+    )
     parser.add_argument(
         "--breaker-window-seconds", type=float, default=60.0,
         help="Circuit breaker: size of the sliding time window (seconds) over which the failure rate "
