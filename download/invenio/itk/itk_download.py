@@ -17,7 +17,7 @@ from pathlib import Path
 ADAPTER_NAME = "itk"
 MODEL_NAME = "itk"  # TODO confirm against a live .well-known/repository response
 DEFAULT_QUERY = None
-DEFAULT_OUTPUT_DIR = "/home/erutherford/Python WSL/ITk/Download/Data"
+DEFAULT_OUTPUT_DIR = "/home/xyx/Python WSL/ITk/Download/Data"
 
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 

@@ -24,7 +24,7 @@ from pathlib import Path
 ADAPTER_NAME = "delphi"
 MODEL_NAME = "particles"  # confirmed by async_upload.py's docstring; NOT "delphi"
 DEFAULT_QUERY = None
-DEFAULT_OUTPUT_DIR = "/home/erutherford/Python WSL/Delphi/Download/Data"
+DEFAULT_OUTPUT_DIR = "/home/xyx/Python WSL/Delphi/Download/Data"
 
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 

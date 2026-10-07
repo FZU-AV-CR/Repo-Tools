@@ -843,7 +843,7 @@ if __name__ == "__main__":
     _run_via_bulk_async()
 
 #   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/erutherford/Python WSL/Archive/v1/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
+#   python3 fram_upload.py --environment local --data-root "/home/xyx/Python WSL/Archive/v1/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4
 #
 # --date-pattern and --exclude-dirs are FRAM-only flags, hand-parsed out

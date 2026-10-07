@@ -72,7 +72,7 @@ DEFAULT_QUERY = None
 #     --date-field created                (revert to ingestion date)
 DEFAULT_DATE_FIELD = "metadata.observation_time"
 
-DEFAULT_OUTPUT_DIR = "/home/erutherford/Python WSL/download/invenio/fram/Download/Data"
+DEFAULT_OUTPUT_DIR = "/home/xyx/Python WSL/download/invenio/fram/Download/Data"
 
 
 # ============================================================

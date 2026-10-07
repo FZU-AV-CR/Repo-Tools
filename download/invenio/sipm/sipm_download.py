@@ -20,7 +20,7 @@ from pathlib import Path
 ADAPTER_NAME = "sipm"
 MODEL_NAME = "sipm"  # TODO confirm against a live .well-known/repository response
 DEFAULT_QUERY = None
-DEFAULT_OUTPUT_DIR = "/home/erutherford/Python WSL/SiPM/Download/Data"
+DEFAULT_OUTPUT_DIR = "/home/xyx/Python WSL/SiPM/Download/Data"
 
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 

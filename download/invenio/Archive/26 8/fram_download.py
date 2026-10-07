@@ -51,7 +51,7 @@ MODEL_NAME = "fram"
 # --ids/--ids-file/--query/--filter/--year/...).
 DEFAULT_QUERY = None
 
-DEFAULT_OUTPUT_DIR = "/home/erutherford/Python WSL/download/invenio/fram/Download/Data"
+DEFAULT_OUTPUT_DIR = "/home/xyx/Python WSL/download/invenio/fram/Download/Data"
 
 
 # ============================================================
