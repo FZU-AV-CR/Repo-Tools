@@ -199,8 +199,8 @@ def crop_overscans(image, header=None, subtract=True, cfg=None):
             header['CD2_2'] *= -1
 
             if header.get('A_ORDER') and header.get('B_ORDER'):
-                for p in xrange(max(header['A_ORDER'], header['B_ORDER'])+1):
-                    for q in xrange(max(header['A_ORDER'], header['B_ORDER'])+1):
+                for p in range(max(header['A_ORDER'], header['B_ORDER'])+1):
+                    for q in range(max(header['A_ORDER'], header['B_ORDER'])+1):
                         if (q % 2) and header.get('A_%d_%d' % (p,q)):
                             header['A_%d_%d' % (p,q)] *= -1
                         if (q % 2) == 0 and header.get('B_%d_%d' % (p,q)):
@@ -215,7 +215,9 @@ def crop_overscans(image, header=None, subtract=True, cfg=None):
         if cfg is None:
             cfg = find_calibration_config(header)
 
-        if cfg and 'airtemp_a' in cfg and 'airtemp_b' in cfg:
+        # Only needed when the bias is actually subtracted; skipping it otherwise avoids a
+        # KeyError on headers without CCD_AIR when the caller passes subtract=False.
+        if subtract and cfg and 'airtemp_a' in cfg and 'airtemp_b' in cfg:
             bias = header['CCD_AIR']*cfg['airtemp_a'] + cfg['airtemp_b']
 
     if bias is not None and subtract:
