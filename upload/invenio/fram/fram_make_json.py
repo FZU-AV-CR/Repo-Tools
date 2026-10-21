@@ -570,7 +570,7 @@ def build_record(extracted: dict, resource: dict | None = None) -> dict:
                     "description": (
                         "This dataset contains observation data in the fits format. "
                         "The observation comes from robotic telescope "
-                        "(Phototometric Robotic Atmospheric Monitor - FRAM)."
+                        "(Photometric Robotic Atmospheric Monitor - FRAM)."
                     ),
                 }
             ],

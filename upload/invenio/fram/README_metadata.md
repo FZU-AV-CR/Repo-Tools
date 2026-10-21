@@ -296,7 +296,7 @@ Rows are skipped when the path is not under `data3/`, when a required field is m
 3. **`instrument` is inconsistent** between sites (`WF0`, `BART 254/1600 mm`, `FRAM`, `CTA-S1 FRAM`, `WF 4kx4k CCD`) because the observatory software fills `INSTRUME` differently. `pixel_scale` identifies the optics more reliably.
 4. **`observation_time` is truncated to seconds**, and `target` is the combined text. Both match the records already uploaded.
 5. **The uploader writes the same two `related_resources` for every record**, including `FRAM_2024_auger` for non-Auger sites. The generator uses the site-year table instead.
-6. **Typos in the constant texts** ("atmospheric" in `subjects`, "Phototometric" in the abstract) are kept so that new records match those already uploaded.
+6. **Typos in the constant texts** ("atmospheric" in `subjects`, "Photometric" in the abstract) are kept so that new records match those already uploaded.
 7. **`identifiers`** holds only a URL (or an empty value). It is not a persistent identifier such as a DOI. Whether the repository assigns a DOI to each record is not decided by this code.
 8. **Records uploaded earlier** do not carry the new fields (`mean`, `median`, `robust_std`, `instrument`, `pixel_scale`, `ccd_temperature`, `air_temperature`, `bias_level`, `fwhm_*`) and may still contain `0.0` placeholders for calibration frames. They become consistent only after a new upload.
 9. **Night of observation** at `auger2` without `LONGITUD` uses an assumed longitude. The site-versus-longitude check only warns.
