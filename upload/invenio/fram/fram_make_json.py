@@ -131,7 +131,7 @@ SUBJECTS = [
     "Astrophysics",
     "Auger",
     "CTA",
-    "Photometric robotic atmosperic monitor",
+    "Photometric robotic atmospheric monitor",
     "Physics",
     "Paranal",
     "Roque de los Muchachos",
