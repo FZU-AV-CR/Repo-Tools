@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import os, sys, glob
+import os, sys, glob, datetime
 
 import numpy as np
 
@@ -20,8 +20,6 @@ from astropy.coordinates import SkyCoord
 from astropy import units as u
 from astropy.time import Time
 
-from upload.invenio.fram.photometry.fram import Fram, get_night
-
 
 # Disable some annoying warnings from astropy
 import warnings
@@ -33,6 +31,23 @@ warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 warnings.simplefilter(action='ignore', category=ConvergenceWarning)
+
+
+def get_night(time, lon=None, site=None):
+    '''Get night name from UTC time (given as datetime object). Should be identical to how RTS2 does it.'''
+    if lon is None:
+        if site == 'auger':
+            lon = -69.4497
+        elif site == 'cta-n':
+            lon = -17.89
+        elif site == 'cta-s0' or site == 'cta-s1':
+            lon = -70.32482
+        else:
+            lon = 0
+
+    time1 = time + datetime.timedelta(seconds=lon*86400/360 - 86400/2)
+
+    return time1.strftime('%Y%m%d')
 
 
 def save_objects(filename, obj):
@@ -53,7 +68,7 @@ def save_objects(filename, obj):
     obj.write(filename, format='parquet', overwrite=True)
 
 
-def process_file(filename, night=None, site=None, fram=None, verbose=False, replace=False, base='photometry', _tmpdir=None):
+def process_file(filename, night=None, site=None, darkname=None, flatname=None, catname=None, verbose=False, replace=False, base='photometry', _tmpdir=None):
 
     # Base settings
     _workdir = None
@@ -125,25 +140,11 @@ def process_file(filename, night=None, site=None, fram=None, verbose=False, repl
 
     log(f"Image: {image.shape[1]} x {image.shape[0]}")
 
-    if fram is None:
-        fram = Fram()
-
     # Basic calibration
-    darkname = fram.find_image('masterdark', header=header, debug=False, fix_path=True)
-    flatname = fram.find_image('masterflat', header=header, debug=False, fix_path=True)
-
     if darkname:
         dark = fits.getdata(darkname)
     else:
-        dcname = fram.find_image('dcurrent', header=header, debug=False, fix_path=True)
-        biasname = fram.find_image('bias', header=header, debug=False, fix_path=True)
-        if dcname and biasname:
-            bias = fits.getdata(biasname)
-            dc = fits.getdata(dcname)
-
-            dark = bias + header['EXPOSURE']*dc
-        else:
-            dark = None
+        dark = None
 
     if flatname:
         flat = fits.getdata(flatname)
@@ -151,6 +152,7 @@ def process_file(filename, night=None, site=None, fram=None, verbose=False, repl
         flat = None
 
     if dark is None:# or flat is None:
+        log("No master dark provided, exiting")
         save_objects(objname, None)
         return
 
@@ -186,14 +188,12 @@ def process_file(filename, night=None, site=None, fram=None, verbose=False, repl
     if gain > 100:
         gain /= 1000
 
-    if 'WF' in ccd:
-        if site in ['auger', 'auger2']:
-            cat = fram.get_stars(ra0, dec0, sr0, limit=100000, catalog='gaiadr3syn', extra=['r<12', 'var=0'])
-        else:
-            cat = fram.get_stars(ra0, dec0, sr0, limit=100000, catalog='gaiadr3syn', extra=['r<10', 'var=0', 'multi_70=0'])
-
+    if catname:
+        cat = Table.read(catname)
     else:
-        cat = fram.get_stars(ra0, dec0, sr0, catalog='gaiadr3syn', extra=['var=0'], limit=100000)
+        log("No catalogue provided, exiting")
+        save_objects(objname, None)
+        return
 
     log(f"{len(cat)} catalogue stars")
 
@@ -372,31 +372,28 @@ def process_file(filename, night=None, site=None, fram=None, verbose=False, repl
 if __name__ == '__main__':
     from optparse import OptionParser
 
-    import socket
-    if socket.gethostname() == 's122':
-        host = 's104.fzu.cz'
-        tmpdir = '/mnt/data1/karpov/tmp/'
-    else:
-        host = None
-        tmpdir = None
-
     parser = OptionParser(usage="usage: %prog [options] arg")
-    parser.add_option('-d', '--db', help='Database name', action='store', dest='db', type='str', default='fram')
-    parser.add_option('-H', '--host', help='Database host', action='store', dest='dbhost', type='str', default=host)
     parser.add_option('-p', '--photodir', help='Base dir to store photometry', action='store', dest='photodir', type='str', default='photometry')
-    parser.add_option('-t', '--tmpdir', help='Temporary dir', action='store', dest='tmpdir', type='str', default=tmpdir)
+    parser.add_option('-t', '--tmpdir', help='Temporary dir', action='store', dest='tmpdir', type='str', default=None)
     parser.add_option('-r', '--replace', help='Replace already existing records in database', action='store_true', dest='replace', default=False)
     parser.add_option('-v', '--verbose', help='Verbose', action='store_true', dest='verbose', default=False)
+    parser.add_option('-D', '--dark', help='Master dark frame', action='store', dest='dark', type='str', default=None)
+    parser.add_option('-F', '--flat', help='Master flat frame', action='store', dest='flat', type='str', default=None)
+    parser.add_option('-C', '--cat', help='Reference catalogue', action='store', dest='cat', type='str', default=None)
 
     (options,files) = parser.parse_args()
-
-    fram = Fram(dbname=options.db, dbhost=options.dbhost)
 
     for i,filename in enumerate(files):
         if len(files) > 1 and options.verbose:
             print(i, '/', len(files), filename)
         try:
-            process_file(filename, fram=fram, verbose=options.verbose, replace=options.replace, base=options.photodir, _tmpdir=options.tmpdir)
+            process_file(
+                filename,
+                darkname=options.dark, flatname=options.flat,
+                catname=options.cat,
+                verbose=options.verbose, replace=options.replace,
+                base=options.photodir, _tmpdir=options.tmpdir
+            )
         except KeyboardInterrupt:
             raise
         except:

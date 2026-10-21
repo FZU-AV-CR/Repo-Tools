@@ -2,78 +2,51 @@
 FRAM (robotic telescope network) adapter for the generic async/bulk upload
 pipeline (async_upload.py / bulk_async.py).
 
-This replaces the FRAM-specific fram_async_upload.py + fram_bulk_async.py
-pair with a thin adapter that plugs into the same shared engine used by
-itk_upload.py / sipm_upload.py / delphi_upload.py. All FITS-specific logic
-(recursive discovery, header extraction, overscan cropping via
-calibrate.py, spherical-index/footprint computation) now lives here;
-async_upload.py and bulk_async.py are unchanged.
-
-KEY DIFFERENCE FROM itk_upload.py / sipm_upload.py: FRAM has no *.txt
-metadata files at all -- there's exactly one FITS file per record, and its
-own header *is* the metadata. So unlike the other adapters, this one does
-not really use `metadata_dir`: discover_items() walks `data_root`
-recursively for FITS files instead of pairing txt files with data folders.
-`metadata_dir` is still accepted (required by the shared discover_items()
-interface, and bulk_async.py's preflight checks that it exists), but it is
-otherwise ignored by this adapter. By convention, point --metadata-dir at
-the same path as --data-root when running fram_upload.py (see
-DEFAULT_METADATA_DIR below and the CLI usage notes at the bottom of this
-file) so the preflight directory-exists check is trivially satisfied.
-
 Every FITS file (light frame, masterdark, masterflat, bias, dcurrent, ...)
-is uploaded as its own independent record. Calibration frames are NOT
-linked to light frames at upload time -- that association is done at read
-time by the portal, via metadata lookup (site/ccd/camera_serial/binning/
-usable_width/usable_height + type-specific fields + nearest timestamp).
-This means every record's metadata must carry those fields consistently,
+is uploaded as its own record, and its header is the source of the metadata.
+discover_items() walks the data root recursively for FITS files. The shared
+engine requires a `metadata_dir`; FRAM has no separate metadata files, so it is
+accepted but ignored, and --metadata-dir is set to the same path as --data-root
+automatically.
+
+Calibration frames are not linked to light frames at upload time. The
+association is made at read time by a metadata lookup (site, ccd,
+camera_serial, binning, usable_width/usable_height, type-specific fields and
+the nearest timestamp), so every record carries these fields consistently,
 regardless of observation type -- see REQUIRED_METADATA_FIELDS and
-validate_metadata() below.
+validate_metadata().
 
-Overscan cropping and bias subtraction (via calibrate.crop_overscans) are
-applied when computing metadata (usable dimensions, mean, median).
-Linearization is intentionally NOT applied -- mean/median reflect crop+bias
-only. The archived FITS file itself is always the untouched original
-either way.
+Overscan cropping (calibrate.crop_overscans, without bias subtraction and
+without linearization) is applied when computing metadata (usable dimensions,
+mean, median, ...). mean/median therefore match the values of the FRAM
+archive; the overscan bias is stored separately as bias_level. The uploaded
+FITS file itself is always the untouched original.
 
-COMMUNITY HANDLING: unlike SiPM's manual "communities" dict, FRAM sets a
-"community" key in build_invenio_metadata() (the community slug, e.g.
-"fram1"); async_upload.py's upload_record_async() passes it through as the
-community= keyword argument of client.records.create() automatically
-whenever an adapter sets one (see its "if metadata.get('community')"
-check and the "COMMUNITY / WORKFLOW" section of its module docstring), so
-no further engine change is needed. This mirrors the usage shown in
-nrp_cmd's own guide, e.g.:
+COMMUNITY: build_invenio_metadata() sets a "community" key (the community
+slug). async_upload.py passes it to client.records.create() as the community=
+keyword argument, for example:
     record = await client.records.create(
         {...}, community="my-community", workflow="review"
     )
-FRAM_COMMUNITY below is the community slug currently in use; update it if
-Cesnet's community/access workflow for this model changes.
 
-KNOWN OPEN ITEM: camera_serial is now read from the PRODUCT_ID header
-keyword (a HIERARCH keyword in sample headers so far), matching the same
-field calibrate.py's own find_calibration_config() already keys off of
-internally for airtemp-based bias fallbacks and linearization curves --
-this resolves the previous field-name mismatch between the two. What
-remains open: if PRODUCT_ID is not resolvable on the header object
-crop_overscans() receives -- e.g. because it's only present in the
-primary HDU while extract_metadata() reads the header via
-fits.getheader(path, -1), the *last* HDU -- find_calibration_config()
-will raise a KeyError for any file whose overscan can't be measured
-directly from the pixel data, and camera_serial in the output metadata
-will be None rather than raising. Worth checking against a real file
-before a production run.
+CAMERA SERIAL: camera_serial is read from the PRODUCT_ID header keyword
+(HIERARCH, in the image HDU), the same key calibrate.py's
+find_calibration_config() uses. fits.getheader(path, -1) returns the image
+header for both tile-compressed files (empty primary HDU) and plain files.
 
-Which adapter is active is resolved at runtime by adapters.py, not
-hardcoded in async_upload.py/bulk_async.py: this file passes --adapter
-fram to bulk_async.py's CLI (and sets the PHYSICS_ADAPTER env var as a
-fallback) so `python3 fram_upload.py ...` just works, including
-side-by-side with `python3 sipm_upload.py ...` / `python3 itk_upload.py
-...` in separate processes. See adapters.py for the full mechanism.
+QUALITY / REJECTION: extract_metadata() does not raise for a bad file; it
+returns "problems" entries starting with a stable E_* code (see
+validate_metadata()), which end up in the "error" column of upload_stats.csv
+with status=skipped_invalid. Star-based image quality (FWHM) needs the optional
+'sep' package and can be disabled with --no-quality.
 
-Token handling mirrors ITk/SiPM: nothing is hardcoded here.
-bulk_async.py / async_upload.py resolve it the same way
-(--token flag -> INVENIO_TOKEN env var -> interactive prompt).
+The active adapter is resolved at runtime by adapters.py: this file passes
+--adapter fram to bulk_async.py (and sets the PHYSICS_ADAPTER environment
+variable as a fallback), so `python3 fram_upload.py ...` works directly.
+
+The API token is not stored in this file. bulk_async.py / async_upload.py
+resolve it from the --token flag, the INVENIO_TOKEN environment variable or an
+interactive prompt, in that order.
 """
 
 from __future__ import annotations
@@ -81,8 +54,10 @@ from __future__ import annotations
 import datetime
 import fnmatch
 import logging
+import math
 import os
 import re
+import threading
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +69,14 @@ from astropy.wcs import WCS, FITSFixedWarning
 
 from calibrate import crop_overscans
 
+# OPTIONAL dependency (FWHM / star counts only). If it is not installed the
+# image_quality fields are simply left empty and everything else works.
+try:
+    import sep
+    sep.set_extract_pixstack(2_000_000)  # crowded wide-field frames overflow the default 300k
+except ImportError:  # pragma: no cover
+    sep = None
+
 warnings.simplefilter("ignore", FITSFixedWarning)
 
 logger = logging.getLogger(__name__)
@@ -103,19 +86,17 @@ logger = logging.getLogger(__name__)
 # for real runs)
 # ============================================================
 
-# FRAM has no separate metadata directory -- point this at the same root
-# as DEFAULT_DATA_ROOT so bulk_async.py's "does metadata_dir exist?"
-# preflight check passes trivially. discover_items() below ignores its
-# metadata_dir argument entirely.
-DEFAULT_DATA_ROOT = "/home/xy/FRAM/Upload/Data to upload"
+# FRAM has no separate metadata directory. DEFAULT_METADATA_DIR mirrors the data
+# root so that bulk_async.py's "does metadata_dir exist?" check is satisfied;
+# discover_items() ignores it.
+DEFAULT_DATA_ROOT = "/path/to/fram/data"
 DEFAULT_METADATA_DIR = DEFAULT_DATA_ROOT
-DEFAULT_README_FILE = None  # no shared README wired up yet for FRAM (open item)
+DEFAULT_README_FILE = None  # no shared README file for FRAM
 
 # Must match this adapter's key in adapters.ADAPTERS.
 ADAPTER_NAME = "fram"
 
-# Confirmed for local only so far; verify before using with test1/production
-# (same caveat as ITk's / SiPM's DEFAULT_SCHEMA_URL).
+# Sent only with --enable-schema (the "$schema" key is omitted by default).
 DEFAULT_SCHEMA_URL = "local://fram-v1.0.0.json"
 
 FITS_EXTENSIONS = (".fits", ".fit", ".fts")
@@ -125,7 +106,17 @@ HEALPIX_NSIDE = 64  # ~0.9 degree cell resolution; 49,152 total pixels
 # Master-calibration / non-science IMAGETYP values; these are uploaded as
 # their own records too. Kept here only for reference -- no filtering is
 # applied based on this set.
-CALIBRATION_IMAGETYPES = {"masterdark", "masterflat", "bias", "dcurrent"}
+CALIBRATION_IMAGETYPES = {
+    "masterdark", "masterflat", "bias", "dcurrent",  # master / derived frames
+    "dark", "flat", "zero", "flat1",                  # raw calibration exposures
+}
+
+# Already-processed calibration products. They are stored cropped, with bias
+# already removed (masterdark) or normalised (masterflat ~ 1.0), and their
+# AVERAGE/STDEV header keywords are stale copies from the raw inputs. They must
+# NOT go through overscan crop / bias subtraction -- doing so produced negative
+# means (-474, -420) on real examples. The portal likewise displays them as stored.
+MASTER_IMAGETYPES = {"masterdark", "masterflat", "bias", "dcurrent"}
 
 SITE_CANDIDATES = ["auger2", "auger", "cta-n", "cta-s0", "cta-s1"]
 
@@ -158,6 +149,28 @@ DEFAULT_EXCLUDE_DIRS = ["bad"]
 # bias/dcurrent) legitimately have no astronomical target. This is a minimal
 # defensive check, not a substitute for the separate data-cleaning/correction
 # tool planned as its own project.
+# Quality measurement (sep). --no-quality (fram_upload.py CLI) sets the env var.
+QUALITY_DISABLED_ENV_VAR = "FRAM_NO_QUALITY"
+MIN_STARS_FOR_FWHM = 20     # fewer clean stars -> fwhm left empty (cloudy / empty field)
+SEP_DETECT_SIGMA = 5.0
+# FWHM is measured on the central window of at most this many pixels per side (0 = whole
+# frame). Star detection dominates the per-frame cost (55-80% of it on science frames), and
+# on real frames a 2048 window is 3-6x faster while the median FWHM stays within ~5% of the
+# whole-frame value. The centre is usually the best-focused part of the field, so it reads
+# slightly optimistic -- fine as a RELATIVE quality indicator. Frames up to 2048 px are
+# unaffected. Set via --quality-size (fram_upload.py CLI) / FRAM_QUALITY_SIZE.
+QUALITY_SIZE_ENV_VAR = "FRAM_QUALITY_SIZE"
+DEFAULT_QUALITY_SIZE = 2048
+SEP_MAX_PEAK = 40000        # ADU (bias included); excludes (near-)saturated stars of 16-bit cameras
+
+# Plausibility limits for validate_metadata().
+MIN_PLAUSIBLE_YEAR = 2005   # FRAM has been observing since 2007
+
+# Approximate observatory longitudes (deg E), used ONLY for a warning when the
+# site guessed from the file path disagrees with the header's LONGITUD.
+# auger2 is assumed to have the same longitude as auger.
+SITE_LONGITUDES = {"cta-n": -17.89, "auger": -69.45, "auger2": -69.45, "cta-s0": -70.32, "cta-s1": -70.32}
+
 REQUIRED_METADATA_FIELDS = ("site", "ccd", "camera_serial", "binning")
 
 
@@ -185,7 +198,7 @@ CONTRIBUTORS = [
 ]
 
 SUBJECTS = [
-    "Fram",
+    "FRAM",
     "Telescope",
     "Astrophysics",
     "Auger",
@@ -196,10 +209,8 @@ SUBJECTS = [
     "Roque de los Muchachos",
 ]
 
-# Community slug FRAM records are created under, passed to
-# client.records.create() as the community= keyword argument (see
-# "COMMUNITY HANDLING" in the module docstring above). Update if Cesnet
-# changes the community/access workflow for this model.
+# Community slug of FRAM records, passed to client.records.create() as the
+# community= keyword argument (see COMMUNITY in the module docstring).
 FRAM_COMMUNITY = "fram"
 
 
@@ -270,12 +281,9 @@ def discover_items(
     metadata_dir: Path, data_root: Path, readme_file: Path | None = None
 ) -> list[FramWorkItem]:
     """Recursively walk data_root for FITS files; each becomes its own
-    work item. metadata_dir is accepted for interface compatibility with
-    the other adapters but is not used -- FRAM has no separate metadata
-    files, since each FITS file's own header is its metadata.
-
-    readme_file is likewise accepted but unused for now -- FRAM's
-    per-experiment README referencing scheme is still an open item).
+    work item. metadata_dir is accepted for interface compatibility but is
+    not used: each FITS file's own header is its metadata. readme_file is
+    accepted for the same reason and is not used.
 
     Two independent, os.walk-pruning filters (both read from env vars set
     by fram_upload.py's own CLI wrapper -- see --date-pattern and
@@ -296,6 +304,10 @@ def discover_items(
     never even touched -- this matters at FRAM's scale, where walking the
     full tree just to discard most of it afterward would be very slow.
     """
+    if sep is None:
+        logger.warning("'sep' is not installed -- fwhm_* fields will be left empty. pip install sep to enable.")
+    elif os.environ.get(QUALITY_DISABLED_ENV_VAR):
+        logger.info("Quality measurement disabled (--no-quality).")
     date_patterns = _parse_date_patterns()
     exclude_patterns = _parse_exclude_dirs()
     if date_patterns:
@@ -372,22 +384,14 @@ def _compute_footprint(
     the short arc across the antimeridian rather than wrapping around the
     globe.
 
-    BUG FIX (celestial-pole case): images whose field of view contains a
-    celestial pole are a SEPARATE case from ordinary antimeridian-crossing.
-    Near a pole, the 4 corner longitudes spread across nearly the full
-    -180..+180 deg range (RA sweeps through all values over a tiny angular
-    distance on the sky), so the naive 4-point Polygon ring built below is
-    topologically invalid there regardless of `orientation` -- OpenSearch
-    rejects it with a `mapper_parsing_exception` /
-    "Unable to Tessellate shape. Possible malformed shape detected." error
-    (confirmed against real production records -- e.g.
-    20210901202536-251-RA.fits -- whose FOV contains the north celestial
-    pole; this previously made every such record fail to upload entirely).
-    In that case we instead emit a conservative bounding-box `envelope`
-    shape (full longitude range, latitude from the FOV's near edge to the
-    pole) -- verified to be accepted by OpenSearch's geo_shape mapping and
-    to match `intersects` queries the same way a Polygon would, which is
-    all the portal's cone-search round-2 containment check needs.
+    Celestial poles: when the field of view contains a pole, the four corner
+    longitudes spread across nearly the whole -180..+180 deg range, so a
+    four-point Polygon ring is topologically invalid regardless of
+    `orientation` and OpenSearch rejects it ("Unable to Tessellate shape"). In
+    that case a conservative bounding-box `envelope` is returned instead (full
+    longitude range, latitude from the near edge of the field to the pole). It
+    is accepted by the geo_shape mapping and matches `intersects` queries like
+    a Polygon would.
 
     `dec0`/`radius` are the FOV center Dec and half-diagonal angular radius
     (both already computed by the caller from the same WCS) -- a pole is
@@ -425,12 +429,19 @@ def _compute_footprint(
 
 
 def _parse_iso_time(string: str) -> datetime.datetime:
-    return datetime.datetime.strptime(string, "%Y-%m-%dT%H:%M:%S.%f")
+    """DATE-OBS, with or without fractional seconds."""
+    string = str(string).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(string, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"unrecognised DATE-OBS format: {string!r}")
 
 
 def _get_night(time_: datetime.datetime, lon: float | None = None, site: str | None = None) -> str:
     if lon is None:
-        if site == "auger":
+        if site in ("auger", "auger2"):
             lon = -69.4497
         elif site == "cta-n":
             lon = -17.89
@@ -447,80 +458,268 @@ def _get_night(time_: datetime.datetime, lon: float | None = None, site: str | N
 # ============================================================
 
 
-def extract_metadata(item: FramWorkItem) -> dict:
-    """
-    Extract metadata from a single FITS file's header, returning a flat
-    dict. Kept as a sync function since astropy I/O is not async-native --
-    async_upload.py runs this via asyncio.to_thread.
+def _num(header, key: str, lo: float | None = None, hi: float | None = None) -> float | None:
+    """Header value as a finite float, or None when the keyword is missing,
+    non-numeric, NaN/inf, or outside the plausible range [lo, hi].
 
-    No filtering is applied here: every IMAGETYP (object, masterdark,
-    masterflat, bias, dcurrent, ...) is extracted and returned, since each
-    becomes its own record. See validate_metadata() for the minimal
-    downstream sanity check.
+    Out-of-range -> None (not clamped) is deliberate: several FRAM headers
+    carry known-bad values (G2 TEMPPWR=39426 labelled "[%]", MOONDIST=-9e-36,
+    ...), and a wrong number in the archive is worse than an empty field."""
+    value = header.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if lo is not None and number < lo:
+        return None
+    if hi is not None and number > hi:
+        return None
+    return number
 
-    Applies overscan cropping + bias subtraction (calibrate.crop_overscans)
-    but NOT linearization -- usable_width/usable_height/mean/median reflect
-    crop+bias only. The uploaded FITS file itself is always the untouched
-    original; this only affects computed metadata.
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for errors that say nothing about the FILE itself: real I/O errors
+    from the OS (OSError with an errno: input/output error, timeout, stale NFS
+    handle, missing file, ...) and memory pressure. These are re-raised so the
+    engine records status=failed and retries them (also on the next run).
+    Turning them into skipped_invalid would be wrong, because that status is
+    TERMINAL in bulk_async.py: the file would never be retried. Format
+    problems (corrupt/truncated/not FITS) carry no errno and stay E_* skips."""
+    return isinstance(exc, MemoryError) or (isinstance(exc, OSError) and exc.errno is not None)
+
+
+def _str(header, key: str) -> str | None:
+    value = header.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _finite(value) -> float | None:
+    """numpy/py number -> float, or None if NaN/inf (NaN is not valid JSON)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def header_fields(header, is_master: bool = False) -> dict:
+    """Header-derived fields, sanitised. SHARED between the FITS path
+    (_extract_metadata) and convert_dump.py (which feeds it the archive dump's
+    keywords dict), so both apply exactly the same ranges and rules. `header` may
+    be anything with .get() (astropy Header or plain dict).
+
+    bias_level (BIASAVG) is only meaningful for frames whose overscan was cropped,
+    i.e. never for master calibration frames (stored as-is)."""
+    return {
+        "instrument": _str(header, "INSTRUME"),
+        "ccd_temperature": _num(header, "CCD_TEMP", -150, 80),
+        "air_temperature": _num(header, "CCD_AIR", -60, 100),
+        "bias_level": None if is_master else _num(header, "BIASAVG"),
+        "altitude": _num(header, "TEL_ALT"),
+        "azimuth": _num(header, "TEL_AZ"),
+    }
+
+
+def _pixel_scale_arcsec(wcs, header) -> float | None:
+    """Arcsec per (stored, i.e. possibly binned) pixel: from the solved WCS
+    when available, else from the telescope's nominal CDELT1T keyword
+    (present even in darks). CDELT1T is taken to refer to the stored (binned)
+    pixel."""
+    if wcs is not None:
+        try:
+            scale = math.sqrt(abs(float(np.linalg.det(wcs.pixel_scale_matrix)))) * 3600.0
+            if math.isfinite(scale) and scale > 0:
+                return scale
+        except Exception:
+            pass
+    cdelt = _num(header, "CDELT1T")
+    return abs(cdelt) * 3600.0 if cdelt else None
+
+
+def _quality_size() -> int:
+    """Side (px) of the central window used for FWHM; 0 = whole frame."""
+    try:
+        return max(0, int(os.environ.get(QUALITY_SIZE_ENV_VAR, DEFAULT_QUALITY_SIZE)))
+    except ValueError:
+        return DEFAULT_QUALITY_SIZE
+
+
+def _measure_quality(image: np.ndarray, pixel_scale: float | None) -> dict:
+    """Cheap star-based image quality (sep = SExtractor core): number of
+    clean, unsaturated, round stars in the central window (see QUALITY_SIZE) and
+    their median FWHM (from second moments, FWHM = 2.3548 sigma). Approximate -- stars are only ~1.5-2 px
+    wide (undersampled), so treat FWHM as a RELATIVE quality indicator
+    between frames, not an absolute measurement. FWHM is None when fewer than
+    MIN_STARS_FOR_FWHM clean stars are found (cloudy / empty field); n_stars
+    is still reported then, which is itself useful for screening.
+
+    Returns all-None if sep isn't installed, --no-quality was given, or the
+    measurement fails -- never raises."""
+    empty = {"n_stars": None, "fwhm_pixels": None, "fwhm_arcsec": None}
+    if sep is None or os.environ.get(QUALITY_DISABLED_ENV_VAR):
+        return empty
+    try:
+        window = np.asarray(image)
+        size = _quality_size()
+        if size > 0 and (window.shape[0] > size or window.shape[1] > size):
+            h, w = window.shape
+            ch, cw = min(h, size), min(w, size)
+            y0, x0 = (h - ch) // 2, (w - cw) // 2
+            window = window[y0:y0 + ch, x0:x0 + cw]
+        data = np.ascontiguousarray(window, dtype=np.float32)
+        bkg = sep.Background(data)
+        subtracted = data - bkg.back()
+        objs = sep.extract(subtracted, SEP_DETECT_SIGMA, err=bkg.globalrms, minarea=5)
+        a, b = objs["a"], objs["b"]
+        clean = (
+            (objs["flag"] == 0)
+            & (a > 0.5)
+            & (b / np.maximum(a, 1e-6) > 0.7)
+            & (objs["peak"] < SEP_MAX_PEAK)
+        )
+        n_stars = int(clean.sum())
+        result = dict(empty, n_stars=n_stars)
+        if n_stars >= MIN_STARS_FOR_FWHM:
+            fwhm_px = _finite(np.median(2.3548 * np.sqrt((a[clean] ** 2 + b[clean] ** 2) / 2.0)))
+            result["fwhm_pixels"] = fwhm_px
+            if fwhm_px is not None and pixel_scale:
+                result["fwhm_arcsec"] = fwhm_px * pixel_scale
+        return result
+    except Exception as exc:
+        logger.warning("Quality measurement failed: %s: %s", type(exc).__name__, exc)
+        return empty
+
+
+def _extract_metadata(item: FramWorkItem) -> dict:
     """
+    Extract metadata from a single FITS file's header (+ cheap pixel
+    statistics), returning a flat dict. Sync, since astropy I/O is not
+    async-native -- async_upload.py runs this via asyncio.to_thread.
+
+    Never raises for a bad FILE (transient I/O errors and memory errors do raise,
+    see _is_transient): an unreadable/corrupt/odd file yields a dict
+    with a non-empty "problems" list (each entry prefixed with a stable
+    E_* reason code), which validate_metadata() returns as-is, so the record
+    is skipped with status=skipped_invalid and the reason lands in the stats
+    CSV "error" column instead of crashing and being retried 3 times.
+
+    No filtering by IMAGETYP is applied: every type (object, dark, flat,
+    masterdark, masterflat, bias, dcurrent, ...) becomes its own record.
+    Position fields (center/radius/center_geo/footprint/healpix_idx) are
+    only populated when has_position is True, i.e. a science frame with a
+    valid WCS -- never as 0.0 sentinels.
+
+    Applies overscan cropping only -- no bias subtraction and no
+    linearization -- so mean/median/robust_std match the legacy archive. Master
+    calibration frames (MASTER_IMAGETYPES) are used exactly as stored. The
+    uploaded FITS file itself is always the untouched original.
+    """
+    problems: list[str] = []
+    result: dict = {"key": item.key, "filename": item.key, "site": item.site, "problems": problems}
     path_str = str(item.fits_path)
     site = item.site
 
-    header = fits.getheader(path_str, -1)
+    try:
+        header = fits.getheader(path_str, -1)
+        image = fits.getdata(path_str, -1)
+    except Exception as exc:
+        if _is_transient(exc):
+            raise
+        problems.append(f"E_UNREADABLE: {type(exc).__name__}: {exc}")
+        return result
 
-    time_ = _parse_iso_time(header["DATE-OBS"])
+    try:
+        time_ = _parse_iso_time(header["DATE-OBS"])
+    except Exception as exc:
+        problems.append(f"E_BAD_DATE: DATE-OBS missing/unparsable ({type(exc).__name__}: {exc})")
+        return result
+
     if header.get("LONGITUD") is not None:
         night = _get_night(time_, lon=header["LONGITUD"])
     else:
         night = _get_night(time_, site=site)
 
-    image = fits.getdata(path_str, -1)
+    obs_type = str(header.get("IMAGETYP", "unknown")).strip()
+    try:
+        width, height = int(header["NAXIS1"]), int(header["NAXIS2"])
+        if obs_type not in MASTER_IMAGETYPES:
+            image, header = crop_overscans(image, header, subtract=False)
+        usable_width, usable_height = int(image.shape[1]), int(image.shape[0])
+    except Exception as exc:
+        if _is_transient(exc):
+            raise
+        problems.append(f"E_CROP_FAILED: {type(exc).__name__}: {exc}")
+        return result
 
-    width, height = header["NAXIS1"], header["NAXIS2"]
-    image, header = crop_overscans(image, header)
-    usable_width, usable_height = image.shape[1], image.shape[0]
+    if image.size == 0 or float(np.max(image)) == float(np.min(image)):
+        problems.append("E_EMPTY_OR_CONSTANT_IMAGE: no pixel variation")
+        return result
 
-    obs_type = header.get("IMAGETYP", "unknown")
     is_science = obs_type == "object"
     is_calibration = obs_type in CALIBRATION_IMAGETYPES
 
+    # --- sky position (science frames with a valid WCS only) -------------
     wcs = None
+    has_position = False
+    ra0 = dec0 = radius = None
     if is_science and header.get("CTYPE1"):
-        wcs = WCS(header)
-        ra, dec = wcs.all_pix2world(
-            [0, usable_width, 0.5 * usable_width],
-            [0, usable_height, 0.5 * usable_height],
-            0,
-        )
-        radius = 0.5 * _spherical_distance(ra[0], dec[0], ra[1], dec[1])
-        ra0, dec0 = float(ra[2]), float(dec[2])
-    else:
-        ra0, dec0, radius = 0.0, 0.0, 0.0
+        try:
+            wcs = WCS(header)
+            ra, dec = wcs.all_pix2world(
+                [0, usable_width, 0.5 * usable_width],
+                [0, usable_height, 0.5 * usable_height],
+                0,
+            )
+            radius = _finite(0.5 * _spherical_distance(ra[0], dec[0], ra[1], dec[1]))
+            ra0, dec0 = _finite(ra[2]), _finite(dec[2])
+            has_position = (
+                radius is not None and ra0 is not None and dec0 is not None and abs(dec0) <= 90.0
+            )
+        except Exception as exc:
+            logger.warning("[%s] WCS unusable, storing record without sky position: %s", item.key, exc)
+            wcs = None
+            has_position = False
 
-    # Spherical index fields -- always None for calibration frames or when
-    # no valid sky position is available (ra0==0 acts as the sentinel).
-    if is_calibration or ra0 == 0.0:
-        center_geo = None
-        footprint = None
-        healpix_idx = None
-    else:
+    center_geo = footprint = healpix_idx = None
+    if has_position:
         center_geo = {"lat": dec0, "lon": _ra_to_lon(ra0)}
-        footprint = (
-            _compute_footprint(wcs, usable_width, usable_height, dec0, radius)
-            if wcs is not None
-            else None
-        )
+        footprint = _compute_footprint(wcs, usable_width, usable_height, dec0, radius)
         theta = np.radians(90.0 - dec0)  # HEALPix co-latitude
         phi = np.radians(ra0)
         healpix_idx = int(hp.ang2pix(HEALPIX_NSIDE, theta, phi))
+    else:
+        ra0 = dec0 = radius = None
 
+    # --- target: meaningless for calibration frames ----------------------
     target = header.get("TARGET")
     obj_name = header.get("OBJECT")
-    target_display = f"{target} / {obj_name}" if target and obj_name else (target or obj_name)
+    if is_calibration:
+        target_display = None
+    else:
+        target_display = f"{target} / {obj_name}" if target and obj_name else (target or obj_name)
+        target_display = str(target_display) if target_display is not None else None
 
-    return {
-        "key": item.key,
-        "filename": item.key,
+    # --- hardware / optics (deliberately minimal) -------------------------
+    pixel_scale = _pixel_scale_arcsec(wcs, header)
+
+    # --- image statistics: usable area, overscan cropped, bias NOT subtracted
+    # (identical to the legacy archive); robust_std on a subsample.
+    sample = np.asarray(image).ravel()[::7].astype(np.float64)
+    sample_median = float(np.median(sample))
+    robust_std = _finite(1.4826 * np.median(np.abs(sample - sample_median)))
+
+    quality = _measure_quality(image, pixel_scale) if is_science else {
+        "n_stars": None, "fwhm_pixels": None, "fwhm_arcsec": None,
+    }
+
+    result.update({
         "night": night,
         "observation_time": time_.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "creation_date": time_.date().isoformat(),
@@ -528,51 +727,111 @@ def extract_metadata(item: FramWorkItem) -> dict:
         "type": obs_type,
         "filter": header.get("FILTER", "unknown"),
         "ccd": header.get("CCD_NAME"),
-        # Sourced from PRODUCT_ID, matching calibrate.py's own internal
-        # find_calibration_config() lookup key -- see the KNOWN OPEN ITEM
-        # note at the top of this file for the remaining caveat this
-        # doesn't resolve (PRODUCT_ID's resolvability on the header object
-        # itself, not which field name to use).
+        # Sourced from PRODUCT_ID (HIERARCH keyword in the image HDU). Verified
+        # on tile-compressed files (primary HDU empty) AND uncompressed ones
+        # (image in primary HDU) via fits.getheader(path, -1). CCD_SER is NOT
+        # usable: the same value appears on different cameras.
         "camera_serial": (
             str(header["PRODUCT_ID"]) if header.get("PRODUCT_ID") is not None else None
         ),
-        "site": site,
         "ra0": ra0,
         "dec0": dec0,
         "radius": radius,
-        "exposure": header.get("EXPOSURE"),
-        "width": int(width),
-        "height": int(height),
-        "usable_width": int(usable_width),
-        "usable_height": int(usable_height),
+        "has_position": has_position,
+        "exposure": _num(header, "EXPOSURE"),
+        "width": width,
+        "height": height,
+        "usable_width": usable_width,
+        "usable_height": usable_height,
         "binning": header.get("BINNING"),
-        "mean": float(np.mean(image)),
-        "median": float(np.median(image)),
-        "altitude": header.get("TEL_ALT"),
-        "azimuth": header.get("TEL_AZ"),
         "footprint": footprint,
         "center_geo": center_geo,
         "healpix_idx": healpix_idx,
-    }
+        "longitude": _num(header, "LONGITUD"),  # not uploaded; used by validate_metadata()'s site cross-check
+        "n_stars": quality["n_stars"],          # not uploaded; only gates FWHM (see _measure_quality)
+        # --- statistics, hardware and camera-state fields (see metadata.yaml) ---
+        "mean": _finite(np.mean(image)),
+        "median": _finite(np.median(image)),
+        "robust_std": robust_std,
+        "pixel_scale": pixel_scale,
+        # instrument, ccd_temperature, air_temperature, bias_level, altitude, azimuth
+        # (BIASAVG exists only when crop_overscans() measured it from a real overscan
+        # region; empty for cameras without overscan and for master frames -- never
+        # estimated from the temperature model):
+        **header_fields(header, is_master=obs_type in MASTER_IMAGETYPES),
+        "fwhm_arcsec": quality["fwhm_arcsec"],
+        "fwhm_pixels": quality["fwhm_pixels"],
+    })
+    return result
+
+
+_EXTRACT_LIMIT: threading.BoundedSemaphore | None = None
+_EXTRACT_LIMIT_INIT = threading.Lock()
+
+
+def extract_metadata(item: FramWorkItem) -> dict:
+    """Concurrency-bounded wrapper around _extract_metadata().
+
+    async_upload.py runs extraction via asyncio.to_thread, i.e. in the default
+    thread pool (up to ~32 threads), independent of --max-concurrency. One G4
+    frame needs a few hundred MB while being processed, so unbounded
+    extraction can exhaust RAM. At most FRAM_EXTRACT_CONCURRENCY (default 4;
+    --extract-concurrency on the CLI) frames are processed at once; the rest
+    wait here. Upload throughput is rate-limited anyway, so this costs nothing
+    unless the server-side limiter is lifted."""
+    global _EXTRACT_LIMIT
+    if _EXTRACT_LIMIT is None:
+        with _EXTRACT_LIMIT_INIT:
+            if _EXTRACT_LIMIT is None:
+                _EXTRACT_LIMIT = threading.BoundedSemaphore(
+                    max(1, int(os.environ.get("FRAM_EXTRACT_CONCURRENCY", "4")))
+                )
+    with _EXTRACT_LIMIT:
+        return _extract_metadata(item)
 
 
 def validate_metadata(extracted: dict) -> list[str]:
     """Return a list of problems with extracted FITS metadata. An empty
-    list means the record is fine to upload.
+    list means the record is fine to upload. Each entry starts with a
+    stable reason code (E_*), so the stats CSV "error" column can be
+    grouped by reason in the notebook.
 
-    This is a minimal defensive check -- it exists to stop a handful of
-    malformed headers from crashing the batch or silently uploading records
-    with null fields the read-time association logic depends on (site/ccd/
-    camera_serial/binning/usable dimensions). It is NOT a substitute for
-    the more thorough corruption-detection/correction tool planned as a
-    separate project.
+    Codes: E_UNREADABLE, E_BAD_DATE, E_CROP_FAILED, E_EMPTY_OR_CONSTANT_IMAGE
+    (all set by extract_metadata()), plus E_MISSING_FIELD, E_NO_USABLE_SIZE,
+    E_BAD_DATE_RANGE, E_BAD_EXPOSURE (checked here).
+
+    This is a minimal defensive check -- it stops malformed files from
+    crashing the batch or silently uploading records with null fields the
+    read-time calibration association depends on. It does NOT judge
+    scientific quality (clouds, defocus): n_stars/fwhm are stored as
+    metadata for that instead of discarding frames.
     """
-    problems = []
+    problems = list(extracted.get("problems") or [])
+    if problems:
+        return problems  # extraction already failed; nothing more to check
+
     for field in REQUIRED_METADATA_FIELDS:
         if not extracted.get(field):
-            problems.append(f"missing required field: {field}")
+            problems.append(f"E_MISSING_FIELD: {field}")
     if not extracted.get("usable_width") or not extracted.get("usable_height"):
-        problems.append("usable_width/usable_height is zero or missing")
+        problems.append("E_NO_USABLE_SIZE: usable_width/usable_height is zero or missing")
+
+    year = int(extracted["observation_time"][:4])
+    if not (MIN_PLAUSIBLE_YEAR <= year <= datetime.date.today().year + 1):
+        problems.append(f"E_BAD_DATE_RANGE: observation year {year} is implausible")
+    exposure = extracted.get("exposure")
+    if exposure is not None and exposure < 0:
+        problems.append(f"E_BAD_EXPOSURE: negative exposure {exposure}")
+
+    # Soft cross-check only (warning, never a rejection): site guessed from
+    # the file path vs the observatory longitude in the header itself.
+    site, lon = extracted.get("site"), extracted.get("longitude")
+    expected = SITE_LONGITUDES.get(site)
+    if expected is not None and lon is not None and abs(lon - expected) > 2.0:
+        logger.warning(
+            "[%s] site %r (from path) expects longitude ~%.1f but header LONGITUD=%.1f",
+            extracted.get("key"), site, expected, lon,
+        )
     return problems
 
 
@@ -581,98 +840,112 @@ def validate_metadata(extracted: dict) -> list[str]:
 # ============================================================
 
 
+def _drop_none(obj):
+    """Recursively remove None values (and dicts left empty by that) so the
+    JSON only carries fields that really have a value. Omitting is safer
+    than sending explicit nulls: marshmallow can reject null on fields that
+    don't declare allow_none, and OpenSearch treats null and missing alike."""
+    if isinstance(obj, dict):
+        cleaned = {k: _drop_none(v) for k, v in obj.items()}
+        return {k: v for k, v in cleaned.items() if v is not None and v != {}}
+    if isinstance(obj, list):
+        return [_drop_none(v) for v in obj]
+    return obj
+
+
 def build_invenio_metadata(extracted: dict) -> dict:
     title = "FRAM_" + Path(extracted["site"]).stem + "_" + Path(extracted["ccd"]).stem + "_" + Path(extracted["filename"]).stem
     publication_date = datetime.date.today().isoformat()
 
-    return {
-        "metadata": {
-            "resource_type": {"id": "c_ddb1"},
-            "creators": CREATORS,
-            "contributors": CONTRIBUTORS,
-            "file_types": ["fits"],
-            "title": title,
-            "publication_date": publication_date,
-            "publisher": "FZU Institute of Physics of the Czech Academy of Sciences",
-            "additional_descriptions": [
-                {
-                    "lang": {"id": "ENG"},
-                    "type": {"id": "abstract"},
-                    "description": (
-                        "This dataset contains observation data in the fits format. "
-                        "The observation comes from robotic telescope "
-                        "(Photometric Robotic Atmospheric Monitor - FRAM)."
-                    ),
-                }
-            ],
-            "identifiers": [{"identifier": "", "scheme": "url"}],
-            "related_resources": [{"title": "FRAM_2024_auger", "identifiers": [{"identifier": "https://doi.org/10.83100/j3vr-c838", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
-                                  {"title": "FRAM_FZU_root", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
-            "subjects": [{"subject": s} for s in SUBJECTS],
-            "rights": [{"id": "4-BY"}],
-            "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
-            "experiment": {"id": "FRAM"},
-            "target": extracted["target"],
-            "type": extracted["type"],
-            "observation_time": extracted["observation_time"],
-            "observation_night": extracted["night"],
-            "exposure": extracted["exposure"],
-            "center": {"ra": extracted["ra0"], "dec": extracted["dec0"]},
-            "radius": extracted["radius"],
-            "site": extracted["site"],
-            "ccd": extracted["ccd"],
-            "camera_serial": extracted["camera_serial"],
-            "filter": extracted["filter"],
-            "binning": extracted["binning"],
-            "image_size": {
-                "width": extracted["width"],
-                "height": extracted["height"],
-                "usable_width": extracted["usable_width"],
-                "usable_height": extracted["usable_height"],
-            },
-            "declination": extracted["dec0"],
-            "alt_az": {
-                "altitude": extracted["altitude"],
-                "azimuth": extracted["azimuth"],
-            },
-            "filename": extracted["filename"],
-            "footprint": extracted["footprint"],
-            "center_geo": extracted["center_geo"],
-            "healpix_idx": extracted["healpix_idx"],
+    metadata = {
+        "resource_type": {"id": "c_ddb1"},
+        "creators": CREATORS,
+        "contributors": CONTRIBUTORS,
+        "file_types": ["fits"],
+        "title": title,
+        "publication_date": publication_date,
+        "publisher": "FZU Institute of Physics of the Czech Academy of Sciences",
+        "additional_descriptions": [
+            {
+                "lang": {"id": "ENG"},
+                "type": {"id": "abstract"},
+                "description": (
+                    "This dataset contains observation data in the FITS format. "
+                    "The observation comes from a robotic telescope "
+                    "(Photometric Robotic Atmospheric Monitor - FRAM)."
+                ),
+            }
+        ],
+        "identifiers": [{"identifier": "", "scheme": "url"}],
+        "related_resources": [{"title": "FRAM_2024_auger", "identifiers": [{"identifier": "https://doi.org/10.83100/j3vr-c838", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
+                              {"title": "FRAM Robotic Telescopes Data Collection", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
+        "subjects": [{"subject": s} for s in SUBJECTS],
+        "rights": [{"id": "4-BY"}],
+        "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
+        "experiment": {"id": "FRAM"},
+        "target": extracted["target"],
+        "type": extracted["type"],
+        "observation_time": extracted["observation_time"],
+        "observation_night": extracted["night"],
+        "exposure": extracted["exposure"],
+        "site": extracted["site"],
+        "ccd": extracted["ccd"],
+        "camera_serial": extracted["camera_serial"],
+        "filter": extracted["filter"],
+        "binning": extracted["binning"],
+        "image_size": {
+            "width": extracted["width"],
+            "height": extracted["height"],
+            "usable_width": extracted["usable_width"],
+            "usable_height": extracted["usable_height"],
         },
+        "alt_az": {
+            "altitude": extracted["altitude"],
+            "azimuth": extracted["azimuth"],
+        },
+        "filename": extracted["filename"],
+        # Image statistics of the usable area: overscan cropped, bias NOT
+        # subtracted (same as the legacy archive; not the raw AVERAGE/STDEV keywords).
+        "mean": extracted["mean"],
+        "median": extracted["median"],
+        "robust_std": extracted["robust_std"],
+        "instrument": extracted["instrument"],
+        "pixel_scale": extracted["pixel_scale"],
+        "ccd_temperature": extracted["ccd_temperature"],
+        "air_temperature": extracted["air_temperature"],
+        "bias_level": extracted["bias_level"],
+        "fwhm_arcsec": extracted["fwhm_arcsec"],
+        "fwhm_pixels": extracted["fwhm_pixels"],
+    }
+
+    # Sky-position fields exist ONLY for science frames with a valid WCS.
+    # Calibration frames / frames without WCS simply don't carry them (the
+    # old 0.0 sentinels were indistinguishable from a real position at
+    # RA=0, Dec=0 and would match cone searches there).
+    if extracted.get("has_position"):
+        metadata["center"] = {"ra": extracted["ra0"], "dec": extracted["dec0"]}
+        metadata["radius"] = extracted["radius"]
+        metadata["footprint"] = extracted["footprint"]
+        metadata["center_geo"] = extracted["center_geo"]
+        metadata["healpix_idx"] = extracted["healpix_idx"]
+
+    return {
+        "metadata": _drop_none(metadata),
         "files": {"enabled": True},
         "access": {
             "record": "public",
             "files": "public",
-            # Real Python types, not the string "false"/"null" this used to
-            # send. Confirmed against an actual published test1 record
-            # (hg8m6-w2179): Invenio coerced the string "false" into a real
-            # boolean false for "active" on its own, but "reason" stayed the
-            # literal string "null" rather than real JSON null -- sending
-            # native types here removes the dependency on that coercion
-            # happening at all, and fixes "reason" outright.
+            # Native Python types (False / None), not the strings "false" / "null".
             "embargo": {"active": False, "reason": None}
         },
         # Passed through by async_upload.py as client.records.create()'s
-        # community= keyword argument -- see "COMMUNITY HANDLING" in the
-        # module docstring. This is the ONLY mechanism that actually works
-        # for FRAM: a top-level "communities" key on the record body (the
-        # previous approach here, "communities": [{"slug": FRAM_COMMUNITY}])
-        # is not a field Invenio's record schema recognizes at that level --
-        # community membership lives under parent.communities, which only
-        # community= (via nrp_cmd's own create()) actually populates.
-        # Confirmed by inspecting an actual published test1 record: sending
-        # the old "communities" key produced parent.communities == {} (no
-        # community at all), despite sending it.
+        # community= keyword argument (see COMMUNITY in the module docstring).
+        # Community membership lives under parent.communities, which only that
+        # argument populates; a top-level "communities" key on the record body
+        # is not recognised.
         "community": FRAM_COMMUNITY,
-        # Metadata-model routing kwarg, per Cesnet's own nrp_cmd usage
-        # example (client.records.create(metadata, model="particles")) --
-        # async_upload.py passes this through automatically as
-        # client.records.create()'s model= keyword argument whenever it's
-        # present. Confirmed working against a real test1 record (its
-        # "$schema" resolved server-side from this, matching
-        # DEFAULT_SCHEMA_URL, even with --disable-schema sending no
-        # "$schema" at all).
+        # Metadata-model routing: async_upload.py passes this as
+        # client.records.create()'s model= keyword argument.
         "model": "fram",
     }
 
@@ -683,39 +956,24 @@ def build_invenio_metadata(extracted: dict) -> dict:
 
 
 def get_upload_files(item: FramWorkItem, extracted: dict) -> list[tuple[str, Path, str]]:
-    """FRAM uploads exactly one FITS file per record -- no zip / multi-file
-    branch, unlike SiPM's tray-folder case."""
+    """FRAM uploads exactly one FITS file per record."""
     return [(item.fits_path.name, item.fits_path, "Measurement data")]
 
 
 # ============================================================
 # CLI ENTRY POINT
 #
-# bulk_async.py itself stays fully generic -- it always requires
-# --metadata-dir/--data-root explicitly and knows nothing about FRAM's
-# default paths. Running it directly means typing those out every time.
-# It also errors out if run directly at all (see its __main__ guard) --
-# this file is the actual entry point.
+# bulk_async.py is the generic engine and cannot be run directly; this file is
+# the entry point for FRAM. It fills in --adapter fram and --metadata-dir (the
+# same path as --data-root) and forwards everything else to bulk_async.py.
 #
-# Assumed layout: async_upload.py / bulk_async.py (the shared engine) live
-# one directory up from this adapter, not alongside it, e.g.:
+# Expected layout: the shared engine (async_upload.py, bulk_async.py,
+# adapters.py) lives one directory above this file. Adjust ENGINE_DIR below if
+# it lives elsewhere.
 #     Upload/async_upload.py
 #     Upload/bulk_async.py
+#     Upload/adapters.py
 #     Upload/FRAM/fram_upload.py   <- this file
-# If that's not where they end up, adjust ENGINE_DIR below.
-#
-#   python3 fram_upload.py --environment local
-#   python3 fram_upload.py --environment test1 --dry-run
-#   python3 fram_upload.py --environment local --data-root "/some/other/Data to upload"
-#
-# --metadata-dir is not meaningful for FRAM (see module docstring) but is
-# still injected below (pointing at the same path as --data-root) purely
-# to satisfy bulk_async.py's generic "does metadata_dir exist?" preflight
-# check; discover_items() above ignores its value.
-#
-# async_upload.py/bulk_async.py need no edits to run this adapter --
-# --adapter fram (injected below) and the PHYSICS_ADAPTER env var both
-# resolve to this module via adapters.py.
 # ============================================================
 
 ENGINE_DIR = Path(__file__).resolve().parent.parent
@@ -783,18 +1041,9 @@ def _run_via_bulk_async() -> None:
     # itself since it's an explicit CLI arg.
     os.environ.setdefault("PHYSICS_ADAPTER", ADAPTER_NAME)
 
-    # By convention (see module docstring), --metadata-dir must always
-    # mirror --data-root for FRAM -- there's no real metadata directory,
-    # so bulk_async.py's "does metadata_dir exist?" preflight check is
-    # trivially satisfied by pointing it at data_root. DEFAULT_METADATA_DIR
-    # only mirrors DEFAULT_DATA_ROOT at *module import time*, though, so if
-    # the caller overrides --data-root on the CLI (e.g. to point at the
-    # real server path instead of the intentionally-bogus default), that
-    # override must also be picked up here for --metadata-dir; otherwise
-    # argparse's last-flag-wins behaviour leaves --metadata-dir pinned to
-    # the stale/bogus DEFAULT_METADATA_DIR while --data-root itself is
-    # correctly overridden -- which is exactly the "default data root does
-    # not exist" error this fixes.
+    # FRAM has no metadata directory, so --metadata-dir always mirrors
+    # --data-root. DEFAULT_METADATA_DIR is computed at import time, so a
+    # --data-root given on the command line must also be used for --metadata-dir.
     user_data_root = _extract_flag_value(sys.argv[1:], "--data-root")
     effective_data_root = user_data_root or DEFAULT_DATA_ROOT
 
@@ -817,6 +1066,22 @@ def _run_via_bulk_async() -> None:
     if date_pattern_value is not None:
         os.environ["FRAM_DATE_PATTERN"] = date_pattern_value
         argv_rest = _strip_flag(argv_rest, "--date-pattern")
+
+    # --quality-size N: side of the central window used for FWHM (default 2048, 0 = whole frame).
+    quality_size = _extract_flag_value(argv_rest, "--quality-size")
+    if quality_size is not None:
+        os.environ["FRAM_QUALITY_SIZE"] = quality_size
+        argv_rest = _strip_flag(argv_rest, "--quality-size")
+
+    # --no-quality: boolean FRAM-only flag, skips star detection / FWHM.
+    if "--no-quality" in argv_rest:
+        os.environ["FRAM_NO_QUALITY"] = "1"
+        argv_rest = [a for a in argv_rest if a != "--no-quality"]
+
+    extract_conc = _extract_flag_value(argv_rest, "--extract-concurrency")
+    if extract_conc is not None:
+        os.environ["FRAM_EXTRACT_CONCURRENCY"] = extract_conc
+        argv_rest = _strip_flag(argv_rest, "--extract-concurrency")
 
     exclude_dirs_value = _extract_flag_value(argv_rest, "--exclude-dirs")
     if exclude_dirs_value is not None:
@@ -842,22 +1107,27 @@ def _run_via_bulk_async() -> None:
 if __name__ == "__main__":
     _run_via_bulk_async()
 
-#   cd upload/invenio/fram
-#   python3 fram_upload.py --environment local --data-root "/home/xyx/Python WSL/Archive/v1/FRAM/Upload/Data to upload/mnt/data3/cta-n/2021/20210409/03185" --dry-run
+# Usage examples. The FRAM-only flags below are parsed in this file and passed
+# on through environment variables, so they do not appear in the --help output
+# of bulk_async.py.
+#
+#   python3 fram_upload.py --environment local --data-root "/path/to/data" --dry-run
 #   python3 fram_upload.py --environment production --max-concurrency 4
 #
-# --date-pattern and --exclude-dirs are FRAM-only flags, hand-parsed out
-# of sys.argv by _run_via_bulk_async() above (via env var) rather than
-# registered with bulk_async.py's argparser -- they will NOT show up in
-# `python3 fram_upload.py --help`, only here and in discover_items()'s
-# docstring.
+#   # Only April and May 2022 (comma-separated YYYYMMDD day-folder glob patterns):
+#   python3 fram_upload.py --environment local --data-root "..." --date-pattern "202204*,202205*"
 #
-#   # Upload only April + May 2022 data, across every site under data_root:
-#   python3 fram_upload.py --environment test1 --data-root "..." --date-pattern "202204*,202205*"
+#   # Skip directories by name at any depth (default: "bad"; replaces the default):
+#   python3 fram_upload.py --environment local --data-root "..." --exclude-dirs "bad,quarantine,test_*"
 #
-#   # Default already skips any directory literally named "bad" at any depth;
-#   # add more names/patterns (comma-separated, replaces the default entirely):
-#   python3 fram_upload.py --environment test1 --data-root "..." --exclude-dirs "bad,quarantine,test_*"
+#   # Limit how many FITS frames are processed at once (RAM; default 4):
+#   python3 fram_upload.py --environment local --data-root "..." --extract-concurrency 2
 #
-#   # Explicitly disable exclusion (upload everything, including "bad" folders):
-#   python3 fram_upload.py --environment test1 --data-root "..." --exclude-dirs ""
+#   # FWHM window: central N x N pixels (default 2048; 0 = whole frame, slowest):
+#   python3 fram_upload.py --environment local --data-root "..." --quality-size 0
+#
+#   # Skip star detection / FWHM (faster; fwhm_* fields stay empty):
+#   python3 fram_upload.py --environment local --data-root "..." --no-quality
+#
+#   # Disable directory exclusion (upload everything, including "bad" folders):
+#   python3 fram_upload.py --environment local --data-root "..." --exclude-dirs ""
