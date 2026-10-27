@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .converter import Converter
-from .paths import PrefixError, output_relative_path
+from .cnv_converter import Converter
+from .cnv_paths import PrefixError, output_relative_path
 
 LOG = logging.getLogger("fram_converter")
 
@@ -46,6 +46,7 @@ class ConversionRunner:
         *,
         prefix: str = "data3",
         extensions: tuple[str, ...] = (".fits", ".fit", ".fts"),
+        skip_dirs: frozenset[str] = frozenset({"bad"}),
         overwrite: bool = False,
         dry_run: bool = False,
         strict_prefix: bool = True,
@@ -63,6 +64,7 @@ class ConversionRunner:
             e.lower() if e.startswith(".") else "." + e.lower()
             for e in extensions
         )
+        self.skip_dirs = frozenset(skip_dirs)
         self.overwrite = overwrite
         self.dry_run = dry_run
         self.strict_prefix = strict_prefix
@@ -85,8 +87,16 @@ class ConversionRunner:
             raise NotADirectoryError(self.root)
 
         for path in self.root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in self.extensions:
-                yield path
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in self.extensions:
+                continue
+            # Skip files that live anywhere inside a banned directory.
+            rel_parts = path.relative_to(self.root).parts
+            if self.skip_dirs.intersection(rel_parts):
+                LOG.debug("SKIP-DIR %s", path)
+                continue
+            yield path
 
     def destination_for(self, source: Path) -> Path:
         try:

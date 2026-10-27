@@ -34,7 +34,12 @@ class FpackConverter(Converter):
         self.executable = executable
 
     def convert(self, source: Path, destination: Path) -> None:
-        cmd = [self.executable, "-F", str(source)]
+        # fpack produces source.fits.fz next to source.
+        # The -F (in-place) flag is not used because fpack 1.7.0 ignores it.
+        packed = Path(str(source) + ".fz")
+        packed.unlink(missing_ok=True)  # remove any stale leftover
+
+        cmd = [self.executable, str(source)]
         completed = subprocess.run(
             cmd,
             check=False,
@@ -49,9 +54,6 @@ class FpackConverter(Converter):
                 f"fpack failed with exit code {completed.returncode}"
                 + (f": {details}" if details else "")
             )
-
-        # fpack -F produces the compressed FITS as source + ".fz".
-        packed = Path(str(source) + ".fz")
 
         if not packed.is_file():
             raise RuntimeError(

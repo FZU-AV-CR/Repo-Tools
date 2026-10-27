@@ -4,8 +4,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from .converter import FpackConverter
-from .runner import ConversionRunner
+from .cnv_converter import FpackConverter
+from .cnv_runner import ConversionRunner
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Number of parallel conversions (default: 1).")
     parser.add_argument("--temp-dir", type=Path,
                         help="Directory for temporary working copies.")
+    parser.add_argument("--skip-dir", metavar="NAME", action="append",
+                        dest="skip_dirs", default=["bad"],
+                        help="Skip files inside directories with this name "
+                             "(anywhere in the path). May be repeated. "
+                             "Default: bad.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace existing output files.")
     parser.add_argument("--dry-run", action="store_true",
@@ -66,6 +71,7 @@ def main() -> int:
             args.destination,
             FpackConverter(args.fpack),
             prefix=args.prefix,
+            skip_dirs=frozenset(args.skip_dirs),
             overwrite=args.overwrite,
             dry_run=args.dry_run,
             workers=args.workers,
