@@ -76,26 +76,38 @@ def _load_uploaded_recids(stats_path: Path) -> set[int]:
     return uploaded
 
 
-async def _upload_with_retries(client, recid, data_dir, metadata_dir, template_path, retries=3, delay=2, file_concurrency=4, upload_limiter=None, zip_sem=None, stats_path=None, stats_format="jsonl"):
+async def _upload_with_retries(client, recid, data_dir, metadata_dir, retries=3, delay=2, file_concurrency=4, upload_limiter=None, zip_sem=None, stats_path=None, stats_format="jsonl"):
     for attempt in range(1, retries + 1):
         try:
-            return await upload_record_async(
+            exc = await upload_record_async(
                 client=client,
                 recid=recid,
                 data_dir=data_dir,
                 metadata_dir=metadata_dir,
-                template_path=template_path,
                 file_concurrency=file_concurrency,
                 upload_limiter=upload_limiter,
                 zip_sem=zip_sem,
                 stats_path=stats_path,
                 stats_format=stats_format,
             )
+            if exc is None:
+                return None
+            # if exc matches "Failures in HTTP transport (x sub-exceptions)"
+            elif "Failures in HTTP transport" in str(exc):
+                logger.warning("[%s] Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
+                retries += 1  # Increase retries for this specific case
+                await asyncio.sleep(delay * attempt)
+            else:
+                logger.warning("[%s]2 Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
+                if attempt == retries:
+                    raise exc
+                await asyncio.sleep(delay * attempt)
         except Exception as exc:
             logger.warning("[%s] Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
             if attempt == retries:
                 raise
             await asyncio.sleep(delay * attempt)
+    return None
 
 
 async def main_async():
@@ -115,14 +127,14 @@ async def main_async():
     data_dir = Path("../data")
     metadata_dir = Path("../metadata")
     master_cache = Path("../delphi_records_master.json")
-    template_path = Path("delphi_nrp_example.json")
+    # template_path = Path("delphi_nrp_example.json")
     max_concurrency = 4
     file_concurrency = 4
     max_retries = 3
     upload_limiter = WeightedSemaphore(50)
     zip_sem = asyncio.Semaphore(2)
     stats_path = Path("upload_stats.csv")
-    stats_format = "csv"  # or "csv"
+    stats_format = "csv"  # "jsonl" or "csv"
 
     # number of files in metadata dir
     meta_files = list(metadata_dir.glob("*.json"))
@@ -175,7 +187,6 @@ async def main_async():
                 recid=rid,
                 data_dir=data_dir,
                 metadata_dir=metadata_dir,
-                template_path=template_path,
                 retries=max_retries,
                 file_concurrency=file_concurrency,
                 upload_limiter=upload_limiter,
@@ -185,7 +196,7 @@ async def main_async():
             )
 
     # print("Debug mode")
-    # ordered = ordered[3:9]  # Limit to first x for testing
+    ordered = ordered[3:9]  # Limit to first x for testing
     tasks = [asyncio.create_task(_run_one(rid)) for rid in ordered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
