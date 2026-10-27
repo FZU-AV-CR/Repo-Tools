@@ -73,7 +73,7 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"Missing NRP async library: {exc}")
 
-from calibrate import crop_overscans
+from upload.Archive.Fram.calibrate import crop_overscans
 
 warnings.simplefilter("ignore", FITSFixedWarning)
 
@@ -132,7 +132,7 @@ SUBJECTS = [
     "Astrophysics",
     "Auger",
     "CTA",
-    "Photometric robotic atmosperic monitor",
+    "Photometric robotic atmospheric monitor",
     "Physics",
     "Paranal",
     "Roque de los Muchachos",
@@ -528,7 +528,7 @@ def build_invenio_metadata(extracted: dict) -> dict:
                     "description": (
                         "This dataset contains observation data in the fits format. "
                         "The observation comes from robotic telescope "
-                        "(Phototometric Robotic Atmospheric Monitor - FRAM)."
+                        "(Photometric Robotic Atmospheric Monitor - FRAM)."
                     ),
                 }
             ],

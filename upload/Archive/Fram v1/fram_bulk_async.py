@@ -32,7 +32,7 @@ import signal
 import time
 from pathlib import Path
 
-import fram_async_upload
+import upload.Archive.Fram.fram_async_upload as fram_async_upload
 
 logger = logging.getLogger(__name__)
 
