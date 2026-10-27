@@ -118,8 +118,8 @@ def _parse_energy_range(energy: str) -> Tuple[int | None, int | None]:
 
 
 def _derive_file_types(record: Dict) -> List[str]:
-    formats = set((record.get("../metadata", {}).get("distribution", {}).get("formats") or []))
-    for item in record.get("../metadata", {}).get("files", []) or []:
+    formats = set((record.get("../../metadata", {}).get("distribution", {}).get("formats") or []))
+    for item in record.get("../../metadata", {}).get("files", []) or []:
         key = (item.get("key") or "").lower()
         if "." in key:
             formats.add(key.rsplit(".", 1)[-1])
@@ -127,7 +127,7 @@ def _derive_file_types(record: Dict) -> List[str]:
 
 
 def transform_cern_metadata(record: Dict) -> Dict:
-    meta = record.get("../metadata", {})
+    meta = record.get("../../metadata", {})
     primary = (meta.get("categories", {}) or {}).get("primary") or ""
     collision = meta.get("collision_information", {}) or {}
     energy = collision.get("energy", "")
@@ -207,12 +207,12 @@ def normalize_remote_checksum(raw_value) -> str:
 
 
 def extract_remote_metadata(commit_payload: Dict) -> Tuple[int, str, str, str]:
-    size = commit_payload.get("size") or commit_payload.get("../metadata", {}).get("size") or 0
+    size = commit_payload.get("size") or commit_payload.get("../../metadata", {}).get("size") or 0
     checksum = normalize_remote_checksum(
-        commit_payload.get("checksum") or commit_payload.get("../metadata", {}).get("checksum")
+        commit_payload.get("checksum") or commit_payload.get("../../metadata", {}).get("checksum")
     )
     content_link = commit_payload.get("links", {}).get("content", "")
-    status = commit_payload.get("status") or commit_payload.get("../metadata", {}).get("status", "unknown")
+    status = commit_payload.get("status") or commit_payload.get("../../metadata", {}).get("status", "unknown")
     return int(size), checksum, content_link, status
 
 

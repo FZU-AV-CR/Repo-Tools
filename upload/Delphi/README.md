@@ -1,6 +1,6 @@
 # Upload Functions
 
-This document explains the upload implementation under `upload/`, with a focus on:
+This document explains the upload implementation under `..`, with a focus on:
 
 - function-level behavior,
 - execution flow,

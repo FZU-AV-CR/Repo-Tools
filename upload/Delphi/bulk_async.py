@@ -97,15 +97,19 @@ async def _upload_with_retries(client, recid, data_dir, metadata_dir, retries=3,
                 logger.warning("[%s] Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
                 retries += 1  # Increase retries for this specific case
                 await asyncio.sleep(delay * attempt)
+            # if FileNotFoundError do not retry
+            elif "FileNotFoundError" in str(exc):
+                logger.error("[%s] Upload canceled (attempt %s/%s): %s", recid, attempt, retries, exc)
+                return None
             else:
                 logger.warning("[%s]2 Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
                 if attempt == retries:
-                    raise exc
+                    return None
                 await asyncio.sleep(delay * attempt)
         except Exception as exc:
-            logger.warning("[%s] Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc)
+            logger.warning("[%s] Upload failed (attempt %s/%s): %s", recid, attempt, retries, exc.__class__.__name__ + ": " + str(exc))
             if attempt == retries:
-                raise
+                return None
             await asyncio.sleep(delay * attempt)
     return None
 
@@ -124,14 +128,14 @@ async def main_async():
     # template_path = Path(args.template)
 
     setup_logging()
-    data_dir = Path("../data")
-    metadata_dir = Path("../metadata")
+    data_dir = Path("../../data")
+    metadata_dir = Path("../../metadata")
     master_cache = Path("../delphi_records_master.json")
     # template_path = Path("delphi_nrp_example.json")
-    max_concurrency = 4
-    file_concurrency = 4
+    max_concurrency = 40
+    file_concurrency = 400
     max_retries = 3
-    upload_limiter = WeightedSemaphore(50)
+    upload_limiter = WeightedSemaphore(5000)
     zip_sem = asyncio.Semaphore(2)
     stats_path = Path("upload_stats.csv")
     stats_format = "csv"  # "jsonl" or "csv"
@@ -196,7 +200,7 @@ async def main_async():
             )
 
     # print("Debug mode")
-    ordered = ordered[3:9]  # Limit to first x for testing
+    # ordered = ordered[69:77]  # Limit to first x for testing
     tasks = [asyncio.create_task(_run_one(rid)) for rid in ordered]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

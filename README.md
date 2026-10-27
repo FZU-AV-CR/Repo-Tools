@@ -14,8 +14,8 @@ The project focuses on:
 ## Main Features
 
 - Download from CERN Open Data Portal via xrootd
-- Async uploader for a single record (`upload/async_upload.py`)
-- Bulk uploader driven by a master cache and recids (`upload/bulk_async.py`)
+- Async uploader for a single record (`upload/Delphi/async_upload.py`)
+- Bulk uploader driven by a master cache and recids (`upload/Delphi/bulk_async.py`)
 - Metadata filling/transformation into Delphi-style output
 - Conditional zipping (large file sets), including archive repair/update logic
 - Concurrency limits (weighted uploads, controlled zip workers)
