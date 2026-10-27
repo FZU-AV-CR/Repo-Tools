@@ -226,7 +226,6 @@ def fill_cern_metadata(source) -> dict:
     elif isinstance(secondary, list) and any(str(s).lower() == "collision" for s in secondary):
         tgt["dataset_type"] = "collision"
     elif isinstance(secondary, list) and any(str(s).lower() == "logbook" for s in secondary):
-        # TODO: fix values
         tgt["dataset_type"] = "logbook"
         tgt["resource_type"] = {"id": "H41Y-FW7B"}  # logbook
         tgt.pop("collision_information", None)  # logbooks don't have collision info

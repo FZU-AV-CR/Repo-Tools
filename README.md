@@ -5,7 +5,7 @@
 Tools for downloading, preparing, transforming, and uploading large scientific datasets and metadata to NRP/Invenio using async workflows.
 
 The project focuses on:
-- High-volume uploads (single and bulk)
+- High-volume uploads (single and bulk) to NRP/Invenio
 - Metadata transformation (CERN-like input -> Delphi-compatible schema)
 - Controlled concurrency (zipping and uploads)
 - Structured performance logging (JSONL/CSV)
@@ -14,8 +14,8 @@ The project focuses on:
 ## Main Features
 
 - Download from CERN Open Data Portal via xrootd
-- Async uploader for a single record (`upload/Delphi/async_upload.py`)
-- Bulk uploader driven by a master cache and recids (`upload/Delphi/bulk_async.py`)
+- Async uploader for a single record
+- Bulk uploader that uses the single file uploader with prioritization and concurrency limits
 - Metadata filling/transformation into Delphi-style output
 - Conditional zipping (large file sets), including archive repair/update logic
 - Concurrency limits (weighted uploads, controlled zip workers)
@@ -51,7 +51,7 @@ sudo apt install build-essential python3-dev
 ## Directory Overview
 
 - `upload/`  
-  Base upload logic (single, bulk, async) with modules for different experiments
+  Base upload logic (single, bulk, async) with modules for different experiments, including `upload/Delphi/` for the current Delphi workflow, `upload/samples/` for sample record uploads and `upload/invenio/` for FRAM upload and metadata extraction.
 
 - `download/`  
   Download automation tools and post-run analysis assets/stat notebooks.
@@ -73,11 +73,14 @@ sudo apt install build-essential python3-dev
 Single record:
 - Input: dataset folder + metadata folder (or direct metadata file)
 - Output: uploaded files + transformed metadata + stats entry
+- Example: `upload/samples/sample_upload.py` demonstrates a single-record Delphi upload flow using a secure repo token from the environment or a prompt.
 
 Bulk:
 - Input: data root + metadata root + master list of records (recids)
 - Behavior: uploads all recids, with configured prioritization and concurrency limits
 - Output: continuous structured stats and logs for each recid
+
+Faster bulk upload can be achieved by uploading directly to S3 and then syncing the records to Invenio but is currently being developed by Cesnet.
 
 ## Logging and Performance Stats
 
