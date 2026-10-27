@@ -2,7 +2,7 @@
 
 How each metadata field of a FRAM record (model `fram`, schema in `metadata.yaml`) is obtained from the FITS file or calculated from it.
 
-*Last updated: 2026-10-16. Describes the code in `fram_upload.py`, `calibrate.py`, `fram_make_json.py` and `convert_dump.py` as delivered together.*
+*Last updated: 2026-10-16. Describes the code in `fram_upload.py`, `calibrate.py` and `fram_make_json.py`.*
 
 ## Contents
 
@@ -16,10 +16,9 @@ How each metadata field of a FRAM record (model `fram`, schema in `metadata.yaml
 8. [What each image type gets](#8-what-each-image-type-gets)
 9. [Validation and rejection codes](#9-validation-and-rejection-codes)
 10. [Header values that are sanitised or deliberately not used](#10-header-values-that-are-sanitised-or-deliberately-not-used)
-11. [Differences when converting from the archive dump](#11-differences-when-converting-from-the-archive-dump)
-12. [Options that change the metadata](#12-options-that-change-the-metadata)
-13. [Known limitations and open items](#13-known-limitations-and-open-items)
-14. [Example record](#14-example-record)
+11. [Options that change the metadata](#11-options-that-change-the-metadata)
+12. [Known limitations and open items](#12-known-limitations-and-open-items)
+13. [Example record](#13-example-record)
 
 ---
 
@@ -29,17 +28,14 @@ How each metadata field of a FRAM record (model `fram`, schema in `metadata.yaml
 |---|---|---|
 | `fram_upload.py` (adapter for `bulk_async.py` / `async_upload.py`) | FITS files | records created and published directly in the repository |
 | `fram_make_json.py` | FITS files | one JSON file per FITS file (mirrored directory tree), to be bulk-imported and paired with the files on S3 |
-| `convert_dump.py` | metadata dump of the legacy FRAM archive | the same JSON records, without reading any FITS file |
 
-All three build the record with the **same code**:
+Both build the record with the **same code**:
 
 - `fram_upload._extract_metadata()` reads the FITS file and returns a flat dictionary of values.
-- `fram_upload.header_fields()` sanitises the header-derived fields (shared with `convert_dump.py`).
+- `fram_upload.header_fields()` sanitises the header-derived fields.
 - `fram_upload.build_invenio_metadata()` turns that dictionary into the record.
 - `fram_make_json.build_record()` adds the three bulk-specific parts (related resources, fixed publication date, `files.entries`).
-- `calibrate.crop_overscans()` provides the overscan crop (inherited from the legacy archive).
-
-`profile_dump.py` is a read-only profiler of the archive dump. It writes no records.
+- `calibrate.crop_overscans()` provides the overscan crop.
 
 ## 2. Conventions
 
@@ -58,7 +54,7 @@ All three build the record with the **same code**:
 | Key | Value | Notes |
 |---|---|---|
 | `metadata` | all fields below | |
-| `files` | `{"enabled": true}` | `fram_make_json.py` and `convert_dump.py` add `"entries": [{"key": <file name>, "path": <path starting at data3>}]` so a bulk-imported record can be paired with its file on S3 |
+| `files` | `{"enabled": true}` | `fram_make_json.py` adds `"entries": [{"key": <file name>, "path": <path starting at data3>}]` so a bulk-imported record can be paired with its file on S3 |
 | `access` | record `public`, files `public`, embargo inactive | |
 | `community` | `fram` | passed to the repository as the community of the record |
 | `model` | `fram` | routes the record to the FRAM metadata model |
@@ -82,11 +78,11 @@ All three build the record with the **same code**:
 | Field | Source | How it is obtained or calculated | Omitted when |
 |---|---|---|---|
 | `title` | computed | `FRAM_<site>_<ccd>_<file name without extension>`, e.g. `FRAM_cta-s1_WF0_20251221013923-634-RA` | never |
-| `filename` | file path | Path of the file in the archive. Uploader: the part of the path after the `mnt` folder (or relative to the data root if there is no `mnt` folder). Generator and dump converter: the path starting at the anchor folder `data3`, e.g. `data3/cta-s1/2025/20251220/01056/WF0/20251221013923-634-RA.fits` | never |
-| `publication_date` | run time | Uploader: day of the run. Generator and converter: `--publication-date`, or `--publication-date-offset-days` days from today, or the day of the run | never |
+| `filename` | file path | Path of the file in the archive. Uploader: the part of the path after the `mnt` folder (or relative to the data root if there is no `mnt` folder). Generator: the path starting at the anchor folder `data3`, e.g. `data3/cta-s1/2025/20251220/01056/WF0/20251221013923-634-RA.fits` | never |
+| `publication_date` | run time | Uploader: day of the run. Generator: `--publication-date`, or `--publication-date-offset-days` days from today, or the day of the run | never |
 | `dates` | header | `[{"date": <UTC date of DATE-OBS>, "type": "Created"}]` | never |
-| `identifiers` | run time | `[{"identifier": "", "scheme": "url"}]`. Uploader: after the draft is created, `async_upload.py` fills the empty identifier with the record's own landing-page URL. Generator and converter: left empty, because the URL does not exist before the record is created | never (value may be empty) |
-| `related_resources` | constant / table | Uploader: one fixed entry, `FRAM_FZU_root` (DOI 10.83100/ddxy-p647), relation `IsPartOf`. Earlier versions also included a hardcoded `FRAM_2024_auger` entry; this was replaced by a single root resource. Site-year specific resources will be managed through repository collections in the production environment. Generator and converter: `FRAM_FZU_root`, preceded by a site-year entry when `--site-year-resources` or `--site-year-resource` supplies a row for the `data3/<site>/<year>/` folders of the path | never |
+| `identifiers` | run time | `[{"identifier": "", "scheme": "url"}]`. Uploader: after the draft is created, `async_upload.py` fills the empty identifier with the record's own landing-page URL. Generator: left empty, because the URL does not exist before the record is created | never (value may be empty) |
+| `related_resources` | constant / table | Uploader: one fixed entry, `FRAM_FZU_root` (DOI 10.83100/ddxy-p647), relation `IsPartOf`. Earlier versions also included a hardcoded `FRAM_2024_auger` entry; this was replaced by a single root resource. Site-year specific resources will be managed through repository collections in the production environment. Generator: `FRAM_FZU_root`, preceded by a site-year entry when `--site-year-resources` or `--site-year-resource` supplies a row for the `data3/<site>/<year>/` folders of the path | never |
 | `identifier` | not populated | integer placeholder defined in the schema, never filled | always |
 
 ### 3.4 Observation
@@ -108,7 +104,7 @@ All three build the record with the **same code**:
 | `ccd` | header `CCD_NAME` | text as stored, e.g. `WF0`, `C0`, `NF4` | never (rejected if missing) |
 | `camera_serial` | header `PRODUCT_ID` | written as text, e.g. `6204`. `CCD_SER` is **not** used because the same value appears on different cameras | never (rejected if missing) |
 | `binning` | header `BINNING` | text such as `1x1`, `2x2` | never (rejected if missing) |
-| `image_size.width`, `.height` | header `NAXIS1`, `NAXIS2` | size of the stored image, i.e. the full chip including overscan | never for FITS files (a frame without these keywords is rejected as `E_CROP_FAILED`). Dump converter: when the archive column is empty |
+| `image_size.width`, `.height` | header `NAXIS1`, `NAXIS2` | size of the stored image, i.e. the full chip including overscan | never for FITS files (a frame without these keywords is rejected as `E_CROP_FAILED`) |
 | `image_size.usable_width`, `.usable_height` | computed | shape of the image after the overscan crop ([section 4](#4-overscan-crop-usable-area-and-bias-level)). For master frames the stored size | never (rejected if zero) |
 | `instrument` | header `INSTRUME` | stripped text, copied as is | keyword missing or empty |
 | `pixel_scale` | computed | arcseconds per stored (possibly binned) pixel. With a solved WCS (science frames): the square root of the absolute determinant of the WCS pixel-scale matrix, times 3600. Otherwise from the nominal telescope scale: the absolute value of header `CDELT1T` times 3600 | no WCS and no `CDELT1T` |
@@ -222,7 +218,7 @@ Treat FWHM as a **relative indicator** of image quality, not an absolute measure
 
 ## 9. Validation and rejection codes
 
-A frame that fails a check gets **no record**. The uploader writes the reason into the `error` column of `upload_stats.csv` with status `skipped_invalid`. The generator writes it to `errors.csv`. The dump converter writes it to `conversion_stats.csv`.
+A frame that fails a check gets **no record**. The uploader writes the reason into the `error` column of `upload_stats.csv` with status `skipped_invalid`. The generator writes it to `errors.csv`.
 
 | Code | Meaning |
 |---|---|
@@ -258,53 +254,36 @@ The checks do **not** judge scientific quality. Cloudy or defocused frames are k
 
 These stay in the FITS header, which the portal shows unchanged.
 
-## 11. Differences when converting from the archive dump
-
-`convert_dump.py` produces the same record structure by building the same internal dictionary from a dump row and passing it to the same builder. Where a value comes from differs:
-
-| Item | FITS tools | `convert_dump.py` |
-|---|---|---|
-| `mean`, `median` | computed from pixels | archive columns (cropped, bias not subtracted: the same definition, verified on one frame) |
-| `robust_std`, `fwhm_arcsec`, `fwhm_pixels` | computed | **not available** (need pixels), so absent |
-| `observation_night`, `site`, `ccd`, `camera_serial`, `binning`, `exposure`, usable size | header and path | archive columns |
-| `filter` | header text | archive column. `UNK`, empty or missing become `unknown` |
-| `center`, `radius` | from the WCS | archive columns `ra`, `dec`, `radius`. `center_geo` and `healpix_idx` are recomputed from them |
-| `footprint` | from the WCS corners | archive polygon text converted to GeoJSON (same polygon, but the ring may start at another corner and run in another direction) |
-| `pixel_scale` | WCS matrix | CD matrix from the stored keywords by the same formula, otherwise `CDELT1T` |
-| `instrument`, temperatures, `bias_level`, `alt_az` | header | the archive's stored (already cropped) header, with the same sanitising |
-
-Rows are skipped when the path is not under `data3/`, when a required field is missing, and for duplicates. Paths starting with `calibrations/` get the prefix `data3/`.
-
-## 12. Options that change the metadata
+## 11. Options that change the metadata
 
 | Option | Tool | Effect |
 |---|---|---|
 | `--quality-size N` | uploader, generator | window for the FWHM measurement (default 2048, 0 = whole frame). **Not recorded in the metadata**, so use one value for the whole run |
 | `--no-quality` | uploader, generator | no FWHM fields |
-| `--publication-date`, `--publication-date-offset-days` | generator, converter | `publication_date` of all records |
-| `--site-year-resources`, `--site-year-resource`, `--require-site-year-resource` | generator, converter | adds the site-year entry to `related_resources`, optionally rejects files without one |
+| `--publication-date`, `--publication-date-offset-days` | generator | `publication_date` of all records |
+| `--site-year-resources`, `--site-year-resource`, `--require-site-year-resource` | generator | adds the site-year entry to `related_resources`, optionally rejects files without one |
 | `--site` | generator | forces `site` for every file |
-| `--anchor` | generator, converter | folder name where `filename` starts (default `data3`) |
+| `--anchor` | generator | folder name where `filename` starts (default `data3`) |
 | `--exclude-dirs`, `--date-pattern` | uploader, generator | choose which day folders and directories are processed. No effect on values |
 | `--include-paths`, `--skip-paths` | generator | choose which subtrees are processed. No effect on values |
 | `--extract-concurrency` (uploader), `--workers` (generator) | uploader, generator | memory and speed only. No effect on values |
 | `--require-wcs` | uploader, generator | rejects `object` frames without a valid WCS (→ `E_NO_WCS`); no effect on calibration frames. Off by default |
 | `--dry-run` | generator | runs extraction and validation without writing any JSON files. No effect on values |
 
-## 13. Known limitations and open items
+## 12. Known limitations and open items
 
 1. **FWHM is approximate** (section 7) and depends on `--quality-size`, which is not stored.
 2. **`bias_level` is empty** for masters, for cameras whose raw shape is not in the crop table, and for headers without overscan.
 3. **`instrument` is inconsistent** between sites (`WF0`, `BART 254/1600 mm`, `FRAM`, `CTA-S1 FRAM`, `WF 4kx4k CCD`) because the observatory software fills `INSTRUME` differently. `pixel_scale` identifies the optics more reliably.
 4. **`observation_time` is truncated to seconds**, and `target` is the combined text. Both match the records already uploaded.
-5. **The uploader writes the same two `related_resources` for every record**, including `FRAM_2024_auger` for non-Auger sites. The generator uses the site-year table instead.
+5. **The uploader writes `related_resources` with the root collection DOI** for every record. Site-year specific resources will be managed through repository collections in the production environment.
 6. **Typos in the constant texts** ("atmospheric" in `subjects`, "Photometric" in the abstract) are kept so that new records match those already uploaded.
 7. **`identifiers`** holds only a URL (or an empty value). It is not a persistent identifier such as a DOI. Whether the repository assigns a DOI to each record is not decided by this code.
 8. **Records uploaded earlier** do not carry the new fields (`mean`, `median`, `robust_std`, `instrument`, `pixel_scale`, `ccd_temperature`, `air_temperature`, `bias_level`, `fwhm_*`) and may still contain `0.0` placeholders for calibration frames. They become consistent only after a new upload.
 9. **Night of observation** at `auger2` without `LONGITUD` uses an assumed longitude. The site-versus-longitude check only warns.
-10. **Verification status.** The code was tested on nine real files (G2 and G4 cameras, compressed and plain, 1×1 and 2×2, science, raw dark, master dark, master flat) and compared with one archive row, which matched. **Not yet tested:** the CMOS camera (serial 80011), fields containing a pole or crossing RA 0°, science frames without a WCS in real data, master frames in the archive dump, and a full run over the whole archive.
+10. **Verification status.** The code was tested on nine real files (G2 and G4 cameras, compressed and plain, 1×1 and 2×2, science, raw dark, master dark, master flat) **Not yet tested:** the CMOS camera (serial 80011), fields containing a pole or crossing RA 0°, science frames without a WCS in real data, master frames, and a full run over the whole archive.
 
-## 14. Example record
+## 13. Example record
 
 Science frame `20251221013923-634-RA.fits` (cta-s1, WF0), produced by `fram_make_json.py`. Constant descriptive fields are shortened.
 
