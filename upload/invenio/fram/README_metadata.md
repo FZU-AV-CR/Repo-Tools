@@ -86,7 +86,7 @@ All three build the record with the **same code**:
 | `publication_date` | run time | Uploader: day of the run. Generator and converter: `--publication-date`, or `--publication-date-offset-days` days from today, or the day of the run | never |
 | `dates` | header | `[{"date": <UTC date of DATE-OBS>, "type": "Created"}]` | never |
 | `identifiers` | run time | `[{"identifier": "", "scheme": "url"}]`. Uploader: after the draft is created, `async_upload.py` fills the empty identifier with the record's own landing-page URL. Generator and converter: left empty, because the URL does not exist before the record is created | never (value may be empty) |
-| `related_resources` | constant / table | Uploader: two fixed entries, `FRAM_2024_auger` (DOI 10.83100/j3vr-c838) and `FRAM_FZU_root` (DOI 10.83100/ddxy-p647), relation `IsPartOf`. Generator and converter: `FRAM_FZU_root`, preceded by a site-year entry when `--site-year-resources` or `--site-year-resource` supplies a row for the `data3/<site>/<year>/` folders of the path | never |
+| `related_resources` | constant / table | Uploader: one fixed entry, `FRAM_FZU_root` (DOI 10.83100/ddxy-p647), relation `IsPartOf`. Earlier versions also included a hardcoded `FRAM_2024_auger` entry; this was replaced by a single root resource. Site-year specific resources will be managed through repository collections in the production environment. Generator and converter: `FRAM_FZU_root`, preceded by a site-year entry when `--site-year-resources` or `--site-year-resource` supplies a row for the `data3/<site>/<year>/` folders of the path | never |
 | `identifier` | not populated | integer placeholder defined in the schema, never filled | always |
 
 ### 3.4 Observation
@@ -288,6 +288,8 @@ Rows are skipped when the path is not under `data3/`, when a required field is m
 | `--exclude-dirs`, `--date-pattern` | uploader, generator | choose which day folders and directories are processed. No effect on values |
 | `--include-paths`, `--skip-paths` | generator | choose which subtrees are processed. No effect on values |
 | `--extract-concurrency` (uploader), `--workers` (generator) | uploader, generator | memory and speed only. No effect on values |
+| `--require-wcs` | uploader, generator | rejects `object` frames without a valid WCS (→ `E_NO_WCS`); no effect on calibration frames. Off by default |
+| `--dry-run` | generator | runs extraction and validation without writing any JSON files. No effect on values |
 
 ## 13. Known limitations and open items
 

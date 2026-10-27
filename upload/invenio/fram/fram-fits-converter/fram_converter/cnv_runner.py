@@ -141,14 +141,31 @@ class ConversionRunner:
                 if output_size <= 0:
                     raise RuntimeError("converter produced an empty output")
 
-                # os.replace publishes the completed file atomically.
-                # No partially written target is visible.
+                # Publish the completed file.  os.replace is atomic when
+                # source and destination are on the same filesystem; if they
+                # are on different devices (EXDEV) we fall back to
+                # shutil.move, which copies then unlinks and is still safe
+                # because the converter already validated the output.
                 if target.exists():
                     if not self.overwrite:
                         raise FileExistsError(target)
                     target.unlink()
 
-                os.replace(temp_output, target)
+                try:
+                    os.replace(temp_output, target)
+                except OSError as exc:
+                    import errno
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    # Cross-device: copy to a same-filesystem staging file,
+                    # then rename atomically into place.
+                    stage = target.with_suffix(".tmp~")
+                    try:
+                        shutil.copy2(temp_output, stage)
+                        os.replace(stage, target)
+                    except Exception:
+                        stage.unlink(missing_ok=True)
+                        raise
 
             ratio = input_size / output_size
             LOG.info(

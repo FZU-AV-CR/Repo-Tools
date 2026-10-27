@@ -104,12 +104,17 @@ FITS_EXTENSIONS = (".fits", ".fit", ".fts")
 HEALPIX_NSIDE = 64  # ~0.9 degree cell resolution; 49,152 total pixels
 
 # Master-calibration / non-science IMAGETYP values; these are uploaded as
-# their own records too. Kept here only for reference -- no filtering is
-# applied based on this set.
+# their own records too.
 CALIBRATION_IMAGETYPES = {
     "masterdark", "masterflat", "bias", "dcurrent",  # master / derived frames
     "dark", "flat", "zero", "flat1",                  # raw calibration exposures
 }
+
+# Complete set of IMAGETYP values this pipeline accepts. Any frame whose
+# IMAGETYP is not in this set is rejected with E_BAD_TYPE in validate_metadata().
+# "unknown" (the fallback when the keyword is missing) is intentionally absent
+# so that frames without an IMAGETYP keyword are also rejected.
+KNOWN_IMAGETYPES = CALIBRATION_IMAGETYPES | {"object"}
 
 # Already-processed calibration products. They are stored cropped, with bias
 # already removed (masterdark) or normalised (masterflat ~ 1.0), and their
@@ -143,34 +148,35 @@ DATE_PATTERN_ENV_VAR = "FRAM_DATE_PATTERN"
 EXCLUDE_DIRS_ENV_VAR = "FRAM_EXCLUDE_DIRS"
 DEFAULT_EXCLUDE_DIRS = ["bad"]
 
-# Fields every record must have a usable value for, regardless of observation
-# type, since these drive read-time calibration association. NOTE: "target"
-# is intentionally NOT required -- calibration frames (masterdark/masterflat/
-# bias/dcurrent) legitimately have no astronomical target. This is a minimal
-# defensive check, not a substitute for the separate data-cleaning/correction
-# tool planned as its own project.
-# Quality measurement (sep). --no-quality (fram_upload.py CLI) sets the env var.
+# Quality measurement via SEP (Source Extractor Python).
+# --no-quality disables star detection; --quality-size sets the central window.
 QUALITY_DISABLED_ENV_VAR = "FRAM_NO_QUALITY"
-MIN_STARS_FOR_FWHM = 20     # fewer clean stars -> fwhm left empty (cloudy / empty field)
+REQUIRE_WCS_ENV_VAR = "FRAM_REQUIRE_WCS"   # --require-wcs: reject object frames without WCS
+MIN_STARS_FOR_FWHM = 20       # fewer clean stars → fwhm left empty (cloudy / empty field)
 SEP_DETECT_SIGMA = 5.0
-# FWHM is measured on the central window of at most this many pixels per side (0 = whole
-# frame). Star detection dominates the per-frame cost (55-80% of it on science frames), and
-# on real frames a 2048 window is 3-6x faster while the median FWHM stays within ~5% of the
-# whole-frame value. The centre is usually the best-focused part of the field, so it reads
-# slightly optimistic -- fine as a RELATIVE quality indicator. Frames up to 2048 px are
-# unaffected. Set via --quality-size (fram_upload.py CLI) / FRAM_QUALITY_SIZE.
 QUALITY_SIZE_ENV_VAR = "FRAM_QUALITY_SIZE"
-DEFAULT_QUALITY_SIZE = 2048
-SEP_MAX_PEAK = 40000        # ADU (bias included); excludes (near-)saturated stars of 16-bit cameras
+DEFAULT_QUALITY_SIZE = 2048   # central window side in pixels (0 = whole frame)
+SEP_MAX_PEAK = 40000          # ADU; excludes saturated stars from FWHM measurement
 
 # Plausibility limits for validate_metadata().
-MIN_PLAUSIBLE_YEAR = 2005   # FRAM has been observing since 2007
+MIN_PLAUSIBLE_YEAR = 2005     # FRAM has been observing since 2007
 
-# Approximate observatory longitudes (deg E), used ONLY for a warning when the
+# Approximate observatory longitudes (deg E), used only for a warning when the
 # site guessed from the file path disagrees with the header's LONGITUD.
-# auger2 is assumed to have the same longitude as auger.
 SITE_LONGITUDES = {"cta-n": -17.89, "auger": -69.45, "auger2": -69.45, "cta-s0": -70.32, "cta-s1": -70.32}
 
+# Fields required in every record regardless of observation type, since they
+# drive read-time calibration association. "target" is intentionally absent --
+# calibration frames have no astronomical target.
+#
+# Frame rejection operates at two levels (FRAMSOFTWARE-03 requirement):
+#   1. Observatory: frames that failed astrometric solving are placed in bad/
+#      by the site software; --exclude-dirs bad (the default) skips them.
+#   2. Pipeline: validate_metadata() rejects frames via E_* codes (E_BAD_TYPE,
+#      E_MISSING_FIELD, E_BAD_DATE_RANGE, E_UNREADABLE, optionally E_NO_WCS).
+#
+# Pixel-level quality (saturation fraction, cosmic rays) is not checked here;
+# FWHM and image statistics are stored as metadata for user-side filtering.
 REQUIRED_METADATA_FIELDS = ("site", "ccd", "camera_serial", "binning")
 
 
@@ -209,9 +215,7 @@ SUBJECTS = [
     "Roque de los Muchachos",
 ]
 
-# Community slug of FRAM records, passed to client.records.create() as the
-# community= keyword argument (see COMMUNITY in the module docstring).
-FRAM_COMMUNITY = "fram"
+FRAM_COMMUNITY = "fram"  # community slug, passed to client.records.create()
 
 
 # ============================================================
@@ -798,17 +802,34 @@ def validate_metadata(extracted: dict) -> list[str]:
 
     Codes: E_UNREADABLE, E_BAD_DATE, E_CROP_FAILED, E_EMPTY_OR_CONSTANT_IMAGE
     (all set by extract_metadata()), plus E_MISSING_FIELD, E_NO_USABLE_SIZE,
-    E_BAD_DATE_RANGE, E_BAD_EXPOSURE (checked here).
+    E_BAD_DATE_RANGE, E_BAD_EXPOSURE, E_BAD_TYPE, E_NO_WCS (checked here).
 
     This is a minimal defensive check -- it stops malformed files from
     crashing the batch or silently uploading records with null fields the
     read-time calibration association depends on. It does NOT judge
     scientific quality (clouds, defocus): n_stars/fwhm are stored as
     metadata for that instead of discarding frames.
+
+    E_BAD_TYPE is emitted when IMAGETYP is not in KNOWN_IMAGETYPES (i.e. not
+    one of: object, dark, flat, zero, flat1, masterdark, masterflat, bias,
+    dcurrent). Frames with a missing IMAGETYP keyword get obs_type="unknown"
+    from extract_metadata() and are therefore also rejected.
+
+    E_NO_WCS is only emitted for object frames when FRAM_REQUIRE_WCS is set.
+    Calibration frames (dark, flat, bias, masterdark, masterflat, dcurrent)
+    never carry a WCS and are therefore not affected by this check.
     """
     problems = list(extracted.get("problems") or [])
     if problems:
         return problems  # extraction already failed; nothing more to check
+
+    obs_type = extracted.get("type", "unknown")
+    if obs_type not in KNOWN_IMAGETYPES:
+        problems.append(
+            f"E_BAD_TYPE: IMAGETYP {obs_type!r} is not a known type "
+            f"(expected one of: {', '.join(sorted(KNOWN_IMAGETYPES))})"
+        )
+        return problems  # further checks assume a valid type; skip them
 
     for field in REQUIRED_METADATA_FIELDS:
         if not extracted.get(field):
@@ -822,6 +843,16 @@ def validate_metadata(extracted: dict) -> list[str]:
     exposure = extracted.get("exposure")
     if exposure is not None and exposure < 0:
         problems.append(f"E_BAD_EXPOSURE: negative exposure {exposure}")
+
+    # Optional WCS requirement: reject object frames without a sky position.
+    # Only applies when FRAM_REQUIRE_WCS is set (via --require-wcs CLI flag).
+    # Calibration frames never have a WCS, so the check is type-gated.
+    if (
+        os.environ.get(REQUIRE_WCS_ENV_VAR)
+        and extracted.get("type") == "object"
+        and not extracted.get("has_position")
+    ):
+        problems.append("E_NO_WCS: object frame has no valid astrometric solution (WCS)")
 
     # Soft cross-check only (warning, never a rejection): site guessed from
     # the file path vs the observatory longitude in the header itself.
@@ -876,9 +907,13 @@ def build_invenio_metadata(extracted: dict) -> dict:
                 ),
             }
         ],
-        "identifiers": [{"identifier": "", "scheme": "url"}],
-        "related_resources": [{"title": "FRAM_2024_auger", "identifiers": [{"identifier": "https://doi.org/10.83100/j3vr-c838", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}},
-                              {"title": "FRAM Robotic Telescopes Data Collection", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
+        # Landing-page URL: async_upload.py replaces this placeholder with the
+        # real record URL after creation. The base URL below targets the test
+        # environment and will be updated for production deployment.
+        "identifiers": [{"identifier": "https://test1.physics.du.cesnet.cz/fram/records/" + Path(extracted["site"]).stem + "-" + Path(extracted["filename"]).stem.removesuffix("-RA"), "scheme": "url"}],
+        # Root collection DOI. Site-year specific resources will be linked via
+        # repository collections in the production environment.
+        "related_resources": [{"title": "FRAM Robotic Telescopes Data Collection", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
         "subjects": [{"subject": s} for s in SUBJECTS],
         "rights": [{"id": "4-BY"}],
         "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
@@ -938,15 +973,8 @@ def build_invenio_metadata(extracted: dict) -> dict:
             # Native Python types (False / None), not the strings "false" / "null".
             "embargo": {"active": False, "reason": None}
         },
-        # Passed through by async_upload.py as client.records.create()'s
-        # community= keyword argument (see COMMUNITY in the module docstring).
-        # Community membership lives under parent.communities, which only that
-        # argument populates; a top-level "communities" key on the record body
-        # is not recognised.
-        "community": FRAM_COMMUNITY,
-        # Metadata-model routing: async_upload.py passes this as
-        # client.records.create()'s model= keyword argument.
-        "model": "fram",
+        "community": FRAM_COMMUNITY,  # passed as community= to client.records.create()
+        "model": "fram",              # routes the record to the FRAM metadata model
     }
 
 
@@ -1027,12 +1055,6 @@ def _run_via_bulk_async() -> None:
     if str(ENGINE_DIR) not in sys.path:
         sys.path.insert(0, str(ENGINE_DIR))
 
-    # Loaded via importlib.import_module(), not a literal `import
-    # bulk_async` statement, on purpose: some editors' "organize imports" /
-    # auto-import features rewrite unresolved top-level imports into a
-    # fully-qualified dotted path guessed from the workspace layout, which
-    # breaks this sys.path-based resolution. A function call isn't touched
-    # by those tools.
     bulk_async = importlib.import_module("bulk_async")
 
     # Fallback for any code path that reads the env var instead of the CLI
@@ -1047,20 +1069,9 @@ def _run_via_bulk_async() -> None:
     user_data_root = _extract_flag_value(sys.argv[1:], "--data-root")
     effective_data_root = user_data_root or DEFAULT_DATA_ROOT
 
-    # FRAM-only flags -- not part of bulk_async.py's generic argparser, so
-    # they're pulled out of sys.argv here (via env var, read by
-    # discover_items() in this module) and stripped before forwarding the
-    # rest to bulk_async.main(). See discover_items()'s docstring for what
-    # each actually does.
-    #
-    # --date-pattern "202204*,202205*": comma-separated glob patterns
-    # matched against YYYYMMDD day-folder names; only matching days are
-    # walked. Omit entirely to upload everything (previous behavior).
-    #
-    # --exclude-dirs "bad,other_name": comma-separated glob patterns
-    # matched against any directory NAME, at any depth, that should never
-    # be descended into. Defaults to "bad" if the flag is never passed at
-    # all; pass --exclude-dirs "" explicitly to disable exclusion.
+    # FRAM-only flags are not part of bulk_async.py's argparser. They are
+    # extracted here, stored in env vars (read by discover_items()), and
+    # stripped from argv before forwarding to bulk_async.main().
     argv_rest = sys.argv[1:]
     date_pattern_value = _extract_flag_value(argv_rest, "--date-pattern")
     if date_pattern_value is not None:
@@ -1077,6 +1088,11 @@ def _run_via_bulk_async() -> None:
     if "--no-quality" in argv_rest:
         os.environ["FRAM_NO_QUALITY"] = "1"
         argv_rest = [a for a in argv_rest if a != "--no-quality"]
+
+    # --require-wcs: boolean FRAM-only flag, rejects object frames without a WCS.
+    if "--require-wcs" in argv_rest:
+        os.environ[REQUIRE_WCS_ENV_VAR] = "1"
+        argv_rest = [a for a in argv_rest if a != "--require-wcs"]
 
     extract_conc = _extract_flag_value(argv_rest, "--extract-concurrency")
     if extract_conc is not None:
@@ -1131,3 +1147,7 @@ if __name__ == "__main__":
 #
 #   # Disable directory exclusion (upload everything, including "bad" folders):
 #   python3 fram_upload.py --environment local --data-root "..." --exclude-dirs ""
+#
+#   # Reject object frames without a WCS (writes E_NO_WCS to stats CSV instead of uploading
+#   # without sky-position fields). No effect on calibration frames (dark/flat/bias/...):
+#   python3 fram_upload.py --environment local --data-root "..." --require-wcs

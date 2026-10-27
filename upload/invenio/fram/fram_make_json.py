@@ -3,10 +3,38 @@
 fram_make_json.py -- walk a folder recursively for FRAM FITS files and write
 one JSON metadata file per FITS file, into a mirrored directory tree.
 
-Each JSON has the keys: metadata, files, access, community, model
-(the same content fram_upload.py builds, minus the upload engine).
+Each JSON has the keys: metadata, files, access, community, model.
 
-Requires calibrate.py in the same directory, plus astropy, numpy, healpy, scipy.
+SINGLE SOURCE OF TRUTH: metadata extraction, validation and record building are
+NOT duplicated here -- they are imported from fram_upload.py (the same code the
+direct uploader uses), so both paths always produce identical metadata. This
+script only adds what is specific to bulk JSON generation: the directory walk
+and filters, the site-year related-resources table, a fixed publication date,
+the "files.entries" block used to pair each record with its file on S3, and
+atomic mirrored-tree output.
+
+Requires fram_upload.py and calibrate.py in the same directory, plus astropy,
+numpy, healpy, scipy. Optional: sep (star detection for fwhm_arcsec /
+fwhm_pixels; without it those two fields are simply left out, or pass
+--no-quality to skip the measurement on purpose).
+
+WHAT A RECORD CONTAINS (see metadata.yaml / fram_upload.py)
+    Sky-position fields (center, radius, center_geo, footprint, healpix_idx)
+    exist only for science frames with a valid WCS; calibration frames carry no
+    position. Fields without a value are omitted, never written as null/0.0.
+    FWHM is measured on the central --quality-size window (default 2048 px; 0 = whole
+    frame). Searchable fields include mean, median (overscan cropped, bias NOT
+    subtracted), robust_std, instrument, pixel_scale, ccd_temperature,
+    air_temperature, bias_level, fwhm_arcsec, fwhm_pixels. Master calibration
+    frames (masterdark/masterflat/bias/dcurrent) are used exactly as stored.
+    Unreadable / invalid files get no JSON; they are listed in errors.csv with
+    a reason code (E_UNREADABLE, E_BAD_DATE, E_CROP_FAILED,
+    E_EMPTY_OR_CONSTANT_IMAGE, E_MISSING_FIELD, E_NO_USABLE_SIZE,
+    E_BAD_DATE_RANGE, E_BAD_EXPOSURE, E_BAD_TYPE, E_NO_WCS).
+
+REGENERATING AFTER A SCHEMA CHANGE
+    Reruns skip JSON files that already exist. Use a fresh --out folder or
+    pass --overwrite to regenerate JSON for files that were already processed.
 
 PATH KEYS
     Every FITS file gets an "anchor-relative" key: the part of its absolute
@@ -79,18 +107,14 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
-import healpy as hp
 import numpy as np
-from astropy.io import fits
-from astropy.wcs import WCS, FITSFixedWarning
 
-from calibrate import crop_overscans
+import fram_upload as F  # shared extraction / validation / record building
 
-warnings.simplefilter("ignore", FITSFixedWarning)
 # astropy emits a multi-line INFO notice for every header with SIP
-# coefficients but a CTYPE without "-SIP". It is harmless (same behaviour as
-# fram_upload.py) and floods the log, so keep only WARNING and above.
-# Set at import time so every worker process picks it up.
+# coefficients but a CTYPE without "-SIP". It is harmless and floods the log,
+# so keep only WARNING and above. Set at import time so every worker process
+# picks it up. (FITSFixedWarning is already silenced inside fram_upload.)
 logging.getLogger("astropy").setLevel(logging.WARNING)
 logger = logging.getLogger("fram_make_json")
 
@@ -99,43 +123,9 @@ logger = logging.getLogger("fram_make_json")
 # ============================================================
 
 FITS_EXTENSIONS = (".fits", ".fit", ".fts")
-HEALPIX_NSIDE = 64
-CALIBRATION_IMAGETYPES = {"masterdark", "masterflat", "bias", "dcurrent"}
-SITE_CANDIDATES = ["auger2", "auger", "cta-n", "cta-s0", "cta-s1"]
 DATE_DIR_RE = re.compile(r"^\d{8}$")
-REQUIRED_METADATA_FIELDS = ("site", "ccd", "camera_serial", "binning")
-FRAM_COMMUNITY = "fram"
-FRAM_MODEL = "fram"
 DEFAULT_ANCHOR = "data3"
 DEFAULT_EXCLUDE_DIRS = ["bad"]
-
-CREATORS = [
-    {
-        "person_or_org": {
-            "name": "FZU Institute of Physics of the Czech Academy of Sciences",
-            "type": "organizational",
-        },
-    }
-]
-
-CONTRIBUTORS = [
-    {
-        "person_or_org": {"name": "FRAM collaboration", "type": "organizational"},
-        "role": {"id": "ResearchGroup"},
-    }
-]
-
-SUBJECTS = [
-    "Fram",
-    "Telescope",
-    "Astrophysics",
-    "Auger",
-    "CTA",
-    "Photometric robotic atmospheric monitor",
-    "Physics",
-    "Paranal",
-    "Roque de los Muchachos",
-]
 
 # Always present. A site-year specific resource (from the resource table) is
 # placed BEFORE it, as in the original fram_upload.py.
@@ -396,227 +386,32 @@ def discover_json(out_dir, include, skip, exclude_dirs, date_patterns):
 
 
 # ============================================================
-# METADATA EXTRACTION (from fram_upload.py)
+# RECORD BUILDING (extraction + validation live in fram_upload.py)
 # ============================================================
 
 
-def _guess_site(path_str: str) -> str | None:
-    for candidate in SITE_CANDIDATES:
-        if candidate in path_str:
-            return candidate
-    return None
-
-
-def _spherical_distance(ra1, dec1, ra2, dec2) -> float:
-    ra1_rad, dec1_rad = np.radians(ra1), np.radians(dec1)
-    ra2_rad, dec2_rad = np.radians(ra2), np.radians(dec2)
-    dlat = dec2_rad - dec1_rad
-    dlon = ra2_rad - ra1_rad
-    a = np.sin(dlat / 2) ** 2 + np.cos(dec1_rad) * np.cos(dec2_rad) * np.sin(dlon / 2) ** 2
-    return float(np.degrees(2 * np.arcsin(np.sqrt(a))))
-
-
-def _ra_to_lon(ra: float) -> float:
-    return ra - 360.0 if ra > 180.0 else ra
-
-
-def _compute_footprint(wcs, usable_width, usable_height, dec0, radius):
-    """GeoJSON footprint for OpenSearch geo_shape; envelope when a celestial
-    pole is inside the FOV (see fram_upload.py for the rationale)."""
-    try:
-        px = [0, usable_width, usable_width, 0, 0]
-        py = [0, 0, usable_height, usable_height, 0]
-        ras, decs = wcs.all_pix2world(px, py, 0)
-        coords = [[_ra_to_lon(float(ra)), float(dec)] for ra, dec in zip(ras, decs)]
-
-        north = (90.0 - dec0) <= radius
-        south = (dec0 + 90.0) <= radius
-        if north or south:
-            corner_decs = [c[1] for c in coords]
-            lat_lo, lat_hi = (min(corner_decs), 90.0) if north else (-90.0, max(corner_decs))
-            return {"type": "envelope", "coordinates": [[-180.0, lat_hi], [180.0, lat_lo]]}
-
-        lons = [c[0] for c in coords]
-        polygon = {"type": "Polygon", "coordinates": [coords]}
-        if (max(lons) - min(lons)) > 180.0:
-            polygon["orientation"] = "right"
-        return polygon
-    except Exception:
-        return None
-
-
-def _parse_iso_time(string: str) -> datetime.datetime:
-    return datetime.datetime.strptime(string, "%Y-%m-%dT%H:%M:%S.%f")
-
-
-def _get_night(time_, lon=None, site=None) -> str:
-    if lon is None:
-        if site == "auger":
-            lon = -69.4497
-        elif site == "cta-n":
-            lon = -17.89
-        elif site in ("cta-s0", "cta-s1"):
-            lon = -70.32482
-        else:
-            lon = 0
-    shifted = time_ + datetime.timedelta(seconds=lon * 86400 / 360 - 86400 / 2)
-    return shifted.strftime("%Y%m%d")
-
-
-def extract_metadata(fits_path: Path, key: str, site: str | None) -> dict:
-    path_str = str(fits_path)
-    header = fits.getheader(path_str, -1)
-
-    time_ = _parse_iso_time(header["DATE-OBS"])
-    if header.get("LONGITUD") is not None:
-        night = _get_night(time_, lon=header["LONGITUD"])
-    else:
-        night = _get_night(time_, site=site)
-
-    image = fits.getdata(path_str, -1)
-    width, height = header["NAXIS1"], header["NAXIS2"]
-    image, header = crop_overscans(image, header)
-    usable_width, usable_height = image.shape[1], image.shape[0]
-
-    obs_type = header.get("IMAGETYP", "unknown")
-    is_science = obs_type == "object"
-    is_calibration = obs_type in CALIBRATION_IMAGETYPES
-
-    wcs = None
-    if is_science and header.get("CTYPE1"):
-        wcs = WCS(header)
-        ra, dec = wcs.all_pix2world(
-            [0, usable_width, 0.5 * usable_width],
-            [0, usable_height, 0.5 * usable_height],
-            0,
-        )
-        radius = 0.5 * _spherical_distance(ra[0], dec[0], ra[1], dec[1])
-        ra0, dec0 = float(ra[2]), float(dec[2])
-    else:
-        ra0, dec0, radius = 0.0, 0.0, 0.0
-
-    if is_calibration or ra0 == 0.0:
-        center_geo = footprint = healpix_idx = None
-    else:
-        center_geo = {"lat": dec0, "lon": _ra_to_lon(ra0)}
-        footprint = (
-            _compute_footprint(wcs, usable_width, usable_height, dec0, radius)
-            if wcs is not None
-            else None
-        )
-        healpix_idx = int(hp.ang2pix(HEALPIX_NSIDE, np.radians(90.0 - dec0), np.radians(ra0)))
-
-    target = header.get("TARGET")
-    obj_name = header.get("OBJECT")
-    target_display = f"{target} / {obj_name}" if target and obj_name else (target or obj_name)
-
-    return {
-        "key": key,
-        "filename": key,
-        "night": night,
-        "observation_time": time_.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "creation_date": time_.date().isoformat(),
-        "target": target_display,
-        "type": obs_type,
-        "filter": header.get("FILTER", "unknown"),
-        "ccd": header.get("CCD_NAME"),
-        "camera_serial": str(header["PRODUCT_ID"]) if header.get("PRODUCT_ID") is not None else None,
-        "site": site,
-        "ra0": ra0,
-        "dec0": dec0,
-        "radius": radius,
-        "exposure": header.get("EXPOSURE"),
-        "width": int(width),
-        "height": int(height),
-        "usable_width": int(usable_width),
-        "usable_height": int(usable_height),
-        "binning": header.get("BINNING"),
-        "mean": float(np.mean(image)),
-        "median": float(np.median(image)),
-        "altitude": header.get("TEL_ALT"),
-        "azimuth": header.get("TEL_AZ"),
-        "footprint": footprint,
-        "center_geo": center_geo,
-        "healpix_idx": healpix_idx,
+def build_record(
+    extracted: dict,
+    resource: dict | None = None,
+    publication_date: str | None = None,
+) -> dict:
+    """The record fram_upload.py builds (F.build_invenio_metadata), plus the
+    three things specific to bulk JSON generation:
+      - related_resources from the site-year table (instead of the two fixed
+        entries the direct uploader writes),
+      - a fixed publication_date when --publication-date* is given,
+      - files.entries (key + anchor-relative path), used to pair the record
+        with its file on S3 after the bulk record upload."""
+    record = F.build_invenio_metadata(extracted)
+    metadata = record["metadata"]
+    metadata["related_resources"] = related_resources_for(resource)
+    if publication_date is not None:
+        metadata["publication_date"] = publication_date
+    record["files"] = {
+        "enabled": True,
+        "entries": [{"key": Path(extracted["filename"]).name, "path": extracted["filename"]}],
     }
-
-
-def validate_metadata(extracted: dict) -> list[str]:
-    problems = [f"missing required field: {f}" for f in REQUIRED_METADATA_FIELDS if not extracted.get(f)]
-    if not extracted.get("usable_width") or not extracted.get("usable_height"):
-        problems.append("usable_width/usable_height is zero or missing")
-    return problems
-
-
-def build_record(extracted: dict, resource: dict | None = None) -> dict:
-    name = Path(extracted["filename"]).name
-    title = (
-        "FRAM_" + Path(extracted["site"]).stem + "_" + Path(extracted["ccd"]).stem
-        + "_" + Path(extracted["filename"]).stem
-    )
-    return {
-        "metadata": {
-            "resource_type": {"id": "c_ddb1"},
-            "creators": CREATORS,
-            "contributors": CONTRIBUTORS,
-            "file_types": ["fits"],
-            "title": title,
-            "publication_date": datetime.date.today().isoformat(),
-            "publisher": "FZU Institute of Physics of the Czech Academy of Sciences",
-            "additional_descriptions": [
-                {
-                    "lang": {"id": "ENG"},
-                    "type": {"id": "abstract"},
-                    "description": (
-                        "This dataset contains observation data in the fits format. "
-                        "The observation comes from robotic telescope "
-                        "(Photometric Robotic Atmospheric Monitor - FRAM)."
-                    ),
-                }
-            ],
-            "identifiers": [{"identifier": "", "scheme": "url"}],
-            "related_resources": related_resources_for(resource),
-            "subjects": [{"subject": s} for s in SUBJECTS],
-            "rights": [{"id": "4-BY"}],
-            "dates": [{"date": extracted["creation_date"], "type": {"id": "Created"}}],
-            "experiment": {"id": "FRAM"},
-            "target": extracted["target"],
-            "type": extracted["type"],
-            "observation_time": extracted["observation_time"],
-            "observation_night": extracted["night"],
-            "exposure": extracted["exposure"],
-            "center": {"ra": extracted["ra0"], "dec": extracted["dec0"]},
-            "radius": extracted["radius"],
-            "site": extracted["site"],
-            "ccd": extracted["ccd"],
-            "camera_serial": extracted["camera_serial"],
-            "filter": extracted["filter"],
-            "binning": extracted["binning"],
-            "image_size": {
-                "width": extracted["width"],
-                "height": extracted["height"],
-                "usable_width": extracted["usable_width"],
-                "usable_height": extracted["usable_height"],
-            },
-            "declination": extracted["dec0"],
-            "alt_az": {"altitude": extracted["altitude"], "azimuth": extracted["azimuth"]},
-            "filename": extracted["filename"],
-            "footprint": extracted["footprint"],
-            "center_geo": extracted["center_geo"],
-            "healpix_idx": extracted["healpix_idx"],
-        },
-        "files": {
-            "enabled": True,
-            "entries": [{"key": name, "path": extracted["filename"]}],
-        },
-        "access": {
-            "record": "public",
-            "files": "public",
-            "embargo": {"active": False, "reason": None},
-        },
-        "community": FRAM_COMMUNITY,
-        "model": FRAM_MODEL,
-    }
+    return record
 
 
 def _clean(obj):
@@ -648,18 +443,27 @@ NO_RESOURCE_MSG = "no site-year resource row matches this path (--require-site-y
 
 
 def process_one(task) -> tuple[str, str, str]:
-    """task = (fits_path, key, out_path, site_override, resource, missing).
-    Returns (key, status, error); status in ok / invalid / error / no_resource."""
-    fits_path, key, out_path, site_override, resource, missing = task
+    """task = (fits_path, key, out_path, site_override, resource, missing, publication_date,
+               require_wcs, dry_run).
+    Returns (key, status, error); status in ok / dryrun / invalid / error / no_resource.
+    In dry-run mode extraction and validation run normally but no JSON file is written."""
+    fits_path, key, out_path, site_override, resource, missing, publication_date, require_wcs, dry_run = task
     try:
         if missing:
             return key, "no_resource", NO_RESOURCE_MSG
-        site = site_override or _guess_site(fits_path)
-        extracted = extract_metadata(Path(fits_path), key, site)
-        problems = validate_metadata(extracted)
+        site = site_override or F._guess_site(str(fits_path))
+        extracted = F.extract_metadata(F.FramWorkItem(key=key, fits_path=Path(fits_path), site=site))
+        if require_wcs:
+            os.environ[F.REQUIRE_WCS_ENV_VAR] = "1"
+        problems = F.validate_metadata(extracted)
         if problems:
             return key, "invalid", "; ".join(problems)
-        _write_json_atomic(Path(out_path), _clean(build_record(extracted, resource)))
+        if dry_run:
+            return key, "dryrun", ""
+        _write_json_atomic(
+            Path(out_path),
+            _clean(build_record(extracted, resource, publication_date)),
+        )
         return key, "ok", ""
     except Exception as exc:
         tb = traceback.format_exc(limit=3).replace("\n", " | ")
@@ -696,7 +500,7 @@ def out_json_path(out_dir: Path, key: str) -> Path:
     return out_dir / Path(key).with_suffix(".json")
 
 
-def task_generator(args, root, out_dir, include, skip, table, counters):
+def task_generator(args, root, out_dir, include, skip, table, counters, publication_date):
     date_patterns = _csv_arg(args.date_pattern)
     exclude_dirs = _csv_arg(args.exclude_dirs) if args.exclude_dirs is not None else DEFAULT_EXCLUDE_DIRS
     warned: set = set()
@@ -712,7 +516,10 @@ def task_generator(args, root, out_dir, include, skip, table, counters):
             return
         submitted += 1
         resource, missing = resolve_resource(key, args.anchor, table, warned, args.require_site_year_resource)
-        yield (str(fits_path), key, str(target), args.site, resource, missing)
+        yield (
+            str(fits_path), key, str(target), args.site, resource, missing,
+            publication_date, args.require_wcs, args.dry_run,
+        )
 
 
 def patch_task_generator(args, out_dir, include, skip, table, counters):
@@ -771,6 +578,22 @@ def run(args) -> int:
     else:
         logger.info("No site-year resources given -> related_resources = FRAM_FZU_root only.")
 
+    if not patch and args.dry_run:
+        logger.info("DRY RUN: extraction and validation will run, but no JSON files will be written.")
+
+    if not patch:
+        if args.no_quality:
+            # Set before the worker pool is created, so every worker inherits it.
+            os.environ[F.QUALITY_DISABLED_ENV_VAR] = "1"
+            logger.info("--no-quality: fwhm_arcsec / fwhm_pixels will not be measured.")
+        else:
+            os.environ[F.QUALITY_SIZE_ENV_VAR] = str(args.quality_size)
+        if args.no_quality:
+            pass
+        elif F.sep is None:
+            logger.warning("'sep' is not installed -> fwhm_arcsec / fwhm_pixels will be left out "
+                           "(pip install sep, or pass --no-quality to silence this).")
+
     include = _clean_path_list(_csv_arg(args.include_paths) + _read_list_file(args.include_paths_file))
     skip = _clean_path_list(_csv_arg(args.skip_paths) + _read_list_file(args.skip_paths_file))
     if include:
@@ -786,7 +609,7 @@ def run(args) -> int:
         err_writer.writerow(["timestamp", "key", "status", "error"])
 
     counters: dict = defaultdict(int)
-    good = {"ok", "patched", "unchanged"}
+    good = {"ok", "patched", "unchanged", "dryrun"}
     t0 = time.monotonic()
     state = {"last_log": t0, "processed": 0}
 
@@ -811,7 +634,10 @@ def run(args) -> int:
         tasks = patch_task_generator(args, out_dir, include, skip, table, counters)
         func = patch_one
     else:
-        tasks = task_generator(args, root, out_dir, include, skip, table, counters)
+        tasks = task_generator(
+            args, root, out_dir, include, skip, table, counters,
+            args.resolved_publication_date,
+        )
         func = process_one
 
     interrupted = False
@@ -859,6 +685,18 @@ def parse_args(argv=None):
                         "(default: bad; pass \"\" to disable)")
     p.add_argument("--date-pattern", default=None,
                    help="Comma-separated globs for YYYYMMDD day folders, e.g. \"202204*,202205*\"")
+    publication_date_group = p.add_mutually_exclusive_group()
+    publication_date_group.add_argument(
+        "--publication-date",
+        metavar="YYYY-MM-DD",
+        help="Fixed publication date for generated JSON (default: today)",
+    )
+    publication_date_group.add_argument(
+        "--publication-date-offset-days",
+        type=int,
+        metavar="DAYS",
+        help="Publication date this many days from today (must be 0 or greater)",
+    )
     p.add_argument("--site", default=None, help="Override site detection for every file")
     p.add_argument("--site-year-resources", default=None, metavar="CSV",
                    help="CSV with columns site,year,doi,name,invenio_url (invenio_url ignored). "
@@ -871,10 +709,27 @@ def parse_args(argv=None):
     p.add_argument("--patch-related-resources", action="store_true",
                    help="Patch mode: only rewrite related_resources in existing JSON files under --out "
                         "(no FITS files are read)")
-    p.add_argument("--workers", type=int, default=1, help="Parallel worker processes (default: 1)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel worker processes (default: 1). Each worker holds one frame in memory at a "
+                        "time (a few hundred MB for a 4k x 4k frame), so this also bounds RAM use.")
+    p.add_argument("--quality-size", type=int, default=F.DEFAULT_QUALITY_SIZE, metavar="N",
+                   help="FWHM is measured on the central N x N pixels (default %d; 0 = whole frame, "
+                        "3-6x slower on 4k frames). Frames up to N px are measured entirely. Must be 0 or >= 512." % F.DEFAULT_QUALITY_SIZE)
+    p.add_argument("--no-quality", action="store_true",
+                   help="Skip star detection: fwhm_arcsec / fwhm_pixels are left out (faster). "
+                        "Also the behaviour when the optional 'sep' package is not installed.")
+    p.add_argument("--require-wcs", action="store_true",
+                   help="Reject object frames that have no valid astrometric solution (WCS): "
+                        "write them to errors.csv as E_NO_WCS instead of generating a JSON "
+                        "without sky-position fields. Has no effect on calibration frames "
+                        "(dark, flat, bias, masterdark, masterflat, dcurrent).")
     p.add_argument("--max-files", type=int, default=0,
                    help="Process at most N new files this run (0 = no limit)")
     p.add_argument("--overwrite", action="store_true", help="Regenerate JSON files that already exist")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Extract and validate metadata for every FITS file but do not write any JSON. "
+                        "Use this to check a new data root for invalid or rejected frames before a "
+                        "full run. Incompatible with --patch-related-resources.")
     p.add_argument("--errors-csv", default=None, help="Path of errors CSV (default: <out>/errors.csv)")
     p.add_argument("--progress-interval", type=float, default=30.0, help="Seconds between progress lines")
     args = p.parse_args(argv)
@@ -882,10 +737,30 @@ def parse_args(argv=None):
     has_table = bool(args.site_year_resources or args.site_year_resource)
     if not args.patch_related_resources and not args.root:
         p.error("--root is required (except with --patch-related-resources)")
+    if args.dry_run and args.patch_related_resources:
+        p.error("--dry-run cannot be combined with --patch-related-resources")
     if args.patch_related_resources and not has_table:
         p.error("--patch-related-resources needs --site-year-resources and/or --site-year-resource")
     if args.require_site_year_resource and not has_table:
         p.error("--require-site-year-resource needs --site-year-resources and/or --site-year-resource")
+    if args.quality_size != 0 and args.quality_size < 512:
+        p.error("--quality-size must be 0 (whole frame) or at least 512")
+    if args.publication_date is not None:
+        try:
+            parsed_date = datetime.date.fromisoformat(args.publication_date)
+            if parsed_date.isoformat() != args.publication_date:
+                raise ValueError
+        except ValueError:
+            p.error("--publication-date must be a valid date in YYYY-MM-DD format")
+    if args.publication_date_offset_days is not None and args.publication_date_offset_days < 0:
+        p.error("--publication-date-offset-days must be 0 or greater")
+    if args.publication_date is not None:
+        args.resolved_publication_date = args.publication_date
+    else:
+        offset_days = args.publication_date_offset_days or 0
+        args.resolved_publication_date = (
+            datetime.date.today() + datetime.timedelta(days=offset_days)
+        ).isoformat()
     return args
 
 

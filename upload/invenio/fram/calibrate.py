@@ -1,18 +1,29 @@
-from __future__ import absolute_import, division, print_function, unicode_literals
+"""
+CCD calibration support for FRAM telescope data.
+
+Provides per-camera calibration configurations (bias level from air temperature,
+non-linearity correction tables) and image processing utilities:
+
+  find_calibration_config()  -- select the matching config for a given camera/date
+  crop_overscans()           -- crop overscan strips and measure bias level
+  calibrate()                -- full calibration: crop + bias subtraction + linearisation
+  get_cropped_shape()        -- predict post-crop dimensions without reading pixel data
+
+Calibration configurations are keyed by camera serial number (PRODUCT_ID header
+keyword), binning, and optional date range to handle hardware changes over time.
+Used by fram_upload.py and extract_photometry.py.
+"""
+
+from __future__ import annotations
 
 import numpy as np
-
 from scipy.stats import sigmaclip
 
-# Configurations
+# Per-camera calibration configurations.
+# Each entry is matched by find_calibration_config() against the FITS header.
+# Keys: serial (PRODUCT_ID), binning, optional date-before/date-after,
+#       airtemp_a/airtemp_b (bias = a * CCD_AIR + b), points (non-linearity table).
 calibration_configs = [
-    # Old and unsupported?..
-
-    # Auger NF3 {'serial':2328, 'binning':'1x1', 'date-before':'2017-07-01', 'means_min':350, 'means_max':500, 'airtemp_a': -0.46159676, 'airtemp_b':423.75726376}, {'serial':2328, 'binning':'1x1', 'date-after':'2017-07-01', 'means_min':350, 'means_max':500, 'airtemp_a':-0.62109129, 'airtemp_b':398.78857177},
-
-    # WF5 - no science frames?..
-    # {'serial':3072, 'binning':'1x1'},
-
     # La Palma custom G2
     {'serial':2596, 'binning':'1x1', 'airtemp_a':-0.2576, 'airtemp_b':478.2},
 
@@ -94,53 +105,52 @@ calibration_configs = [
      'points':[[0.65284178, 0.86401515], [0.92485919, 0.86590909], [1.22567844, 0.87222222], [1.50729647, 0.88611111], [1.76011265, 0.90063131], [1.95532514, 0.91325758], [2.1281362 , 0.92651515], [2.2593446 , 0.93977273], [2.40015361, 0.95176768], [2.54416283, 0.96628788], [2.70737327, 0.98459596], [2.80017921, 0.99217172], [2.89938556, 0.9959596 ], [3.02099334, 1.00227273], [3.13620072, 1.0104798 ], [3.26740911, 1.01489899], [3.36661546, 1.01931818], [3.47222222, 1.02121212], [3.53302611, 1.01300505], [3.58102919, 1.03888889], [3.64503328, 1.03888889], [3.77624168, 1.04583333], [3.92985151, 1.04583333], [4.04505888, 1.0489899 ], [4.1858679 , 1.05277778], [4.30427547, 1.05972222], [4.40348182, 1.06161616], [4.44828469, 1.05909091], [4.56349206, 1.04646465]]},
 ]
 
-# Selecting proper calibration config
 def find_calibration_config(header=None, serial=None, binning=None, width=None, height=None, date=None):
+    """Return the first matching calibration config for the given camera and date,
+    or None if no entry matches. Accepts either a FITS header or explicit keyword
+    arguments (serial, binning, width, height, date)."""
     if header is None:
-        header = {'product_id':serial, 'BINNING':binning, 'NAXIS1':width, 'NAXIS2':height, 'DATE-OBS':date}
+        header = {'product_id': serial, 'BINNING': binning, 'NAXIS1': width, 'NAXIS2': height, 'DATE-OBS': date}
 
     for cfg in calibration_configs:
         if 'serial' in cfg and cfg.get('serial') != header['product_id']:
             continue
-
         if 'binning' in cfg and cfg.get('binning') != header['BINNING']:
             continue
-
         if 'width' in cfg and cfg.get('width') != header['NAXIS1']:
             continue
-
         if 'height' in cfg and cfg.get('height') != header['NAXIS2']:
             continue
-
         if 'date-before' in cfg and cfg.get('date-before') < header['DATE-OBS']:
             continue
-
         if 'date-after' in cfg and cfg.get('date-after') > header['DATE-OBS']:
             continue
-
         return cfg
 
     return None
 
-# Robust mean
+
 def rmean(data, max=None):
+    """3σ-clipped mean, optionally restricted to values below `max`."""
     if max is not None:
         data = np.asarray(data)
-        data = data[data<max]
+        data = data[data < max]
     return np.mean(sigmaclip(data, 3.0, 3.0)[0])
 
+
 def rstd(data):
-    return 1.4826*np.median(np.abs(data - np.median(data)))
+    """Robust standard deviation (1.4826 × MAD)."""
+    return 1.4826 * np.median(np.abs(data - np.median(data)))
 
-# Parsing of DATASEC-like keywords
 def parse_det(string):
-    '''Parse DATASEC-like keyword'''
-    x0,x1,y0,y1 = [int(_)-1 for _ in sum([_.split(':') for _ in string[1:-1].split(',')], [])]
+    """Parse a FITS DATASEC-style keyword (e.g. '[1:4096,1:4096]') into
+    zero-based (x0, x1, y0, y1) integer indices."""
+    x0, x1, y0, y1 = [int(_) - 1 for _ in sum([_.split(':') for _ in string[1:-1].split(',')], [])]
+    return x0, x1, y0, y1
 
-    return x0,x1,y0,y1
 
 def get_cropped_shape(shape=None, header=None):
-    '''Get the shape of an image after overscan cropping based on its header or, well, shape'''
+    """Return the image shape after overscan cropping, without reading pixel data."""
     if shape is None and header is not None:
         shape = (header['NAXIS2'], header['NAXIS1'])
 
@@ -163,35 +173,42 @@ def get_cropped_shape(shape=None, header=None):
 
 # Cropping of overscans if any
 def crop_overscans(image, header=None, subtract=True, cfg=None):
-    ''''Crop overscans from input image based on its header or dimensions.
-    Also, subtract the 'bias' value estimated from either an overscan or pre-determined temperature trend.
-    '''
+    """Crop overscan strips from a raw FITS image and optionally subtract the bias.
+
+    The bias level is measured from the overscan strip when one is present
+    (written to header keyword BIASAVG). For cameras without overscan, the bias
+    is estimated from the air temperature using the per-camera model in
+    calibration_configs (only when subtract=True). The result is the usable
+    image area. Returns (image, header) when a header is supplied, otherwise
+    the image array alone.
+
+    Master calibration frames (masterdark, masterflat, bias, dcurrent) are
+    already processed products and should not be passed to this function.
+    """
     if header is not None:
         header = header.copy()
 
-    # Estimate bias level from overscan
     bias = None
 
-    if image.shape == (4124, 4148): # Initial patched G4 firmware
-        # bias = rmean(list(image[2:8, 300:-300].flatten()) + list(image[-14:, 300:-300].flatten()))
+    if image.shape == (4124, 4148):  # G4, initial patched firmware
         bias = rmean(image[-14:-4, 800:-800].flatten())
 
-    elif image.shape == (2062, 2074) and header.get('BINNING') == '2x2': # The same, 2x2 binning
+    elif image.shape == (2062, 2074) and header.get('BINNING') == '2x2':  # G4, 2x2
         bias = rmean(image[-7:-2, 400:-400].flatten())
 
-    elif image.shape == (4127,4144): # Official firmwares after enabling overscans in Windows utility
-        # bias = rmean(list(image[3:7, 300:-300].flatten()) + list(image[-17:-4, 300:-300].flatten()))
+    elif image.shape == (4127, 4144):  # G4, official firmware with overscans
         bias = rmean(image[-14:-4, 800:-800].flatten())
 
-    elif image.shape == (2063, 2072) and header.get('BINNING') == '2x2': # The same, 2x2 binning
+    elif image.shape == (2063, 2072) and header.get('BINNING') == '2x2':  # G4, 2x2
         bias = rmean(image[-7:-2, 400:-400].flatten())
 
-    elif image.shape == (1026, 1062): # Overscan-enabled custom G2 on La Palma
+    elif image.shape == (1026, 1062):  # Custom G2, La Palma
         bias = rmean(list(image[:, -5:]))
 
     elif header and header.get('product_id') >= 6000 and header.get('SHIFT') is not None and image.shape == (4096, 4096):
-        # Ultra-special handling of a MICCD frames what are vertically flipped in respect to GXCCD ones
-        image = image[::-1, :] # Flip the image
+        # MICCD (serial ≥ 6000) frames are stored vertically flipped relative to GXCCD.
+        # Flip the image and adjust WCS keywords accordingly.
+        image = image[::-1, :]
 
         if header.get('CRPIX1') is not None:
             header['CRPIX2'] = header['NAXIS2'] + 1 - header['CRPIX2']
@@ -199,19 +216,18 @@ def crop_overscans(image, header=None, subtract=True, cfg=None):
             header['CD2_2'] *= -1
 
             if header.get('A_ORDER') and header.get('B_ORDER'):
-                for p in range(max(header['A_ORDER'], header['B_ORDER'])+1):
-                    for q in range(max(header['A_ORDER'], header['B_ORDER'])+1):
-                        if (q % 2) and header.get('A_%d_%d' % (p,q)):
-                            header['A_%d_%d' % (p,q)] *= -1
-                        if (q % 2) == 0 and header.get('B_%d_%d' % (p,q)):
-                            header['B_%d_%d' % (p,q)] *= -1
+                for p in range(max(header['A_ORDER'], header['B_ORDER']) + 1):
+                    for q in range(max(header['A_ORDER'], header['B_ORDER']) + 1):
+                        if (q % 2) and header.get('A_%d_%d' % (p, q)):
+                            header['A_%d_%d' % (p, q)] *= -1
+                        if (q % 2) == 0 and header.get('B_%d_%d' % (p, q)):
+                            header['B_%d_%d' % (p, q)] *= -1
 
     if bias is not None:
         if header is not None:
-            # Store overscan-estimated bias level to FITS header
             header['BIASAVG'] = bias
     else:
-        # No overscans, let's try to fit it if we have a model for this configuration
+        # No overscan strip; fall back to temperature model if available.
         if cfg is None:
             cfg = find_calibration_config(header)
 
@@ -285,42 +301,42 @@ def crop_overscans(image, header=None, subtract=True, cfg=None):
         header['NAXIS1'] = image.shape[1]
         header['NAXIS2'] = image.shape[0]
 
-        return image,header
+        return image, header
     else:
         return image
 
+
 def calibrate(image, header, dark=None, crop=True, subtract=True, linearize=True):
-    '''Higher-level image calibration based on its header.
-    Includes overscan cropping and subtraction, bias subtraction and linearization.'''
+    """Full image calibration: overscan crop, bias subtraction, dark subtraction,
+    and non-linearity correction. Returns (image, header)."""
     cfg = find_calibration_config(header)
 
     if crop:
-        image,header = crop_overscans(image, header, subtract=subtract, cfg=cfg)
+        image, header = crop_overscans(image, header, subtract=subtract, cfg=cfg)
 
     if dark is not None:
         if dark.shape != image.shape:
             print("Wrong dark shape:", dark.shape, "vs", image.shape)
         else:
-            image = 1.0*image - dark
+            image = 1.0 * image - dark
 
     header = header.copy()
 
-    # Sanitize GAIN value from La Palma custom G2 (MICCD driver)
+    # Correct GAIN reported in milli-units by the La Palma G2 MICCD driver.
     if 'GAIN' in header and header['GAIN'] > 1000:
-        header['GAIN'] = 1e-3*header['GAIN']
+        header['GAIN'] = 1e-3 * header['GAIN']
 
     if linearize:
         if cfg and 'points' in cfg:
             points = np.array(cfg['points'])
-            x = np.power(10.0, points[:,0])
-            y = points[:,1]
+            x = np.power(10.0, points[:, 0])
+            y = points[:, 1]
             image = image.copy()
             flat = image.ravel()
             interp = np.interp(flat, x, y)
-            # np.interp clamps out-of-range values; adjust with linear extrapolation.
+            # np.interp clamps out-of-range values; extend with linear extrapolation.
             if flat.size:
-                x0 = x[0]
-                x1 = x[-1]
+                x0, x1 = x[0], x[-1]
                 if flat.min() < x0:
                     slope_low = (y[1] - y[0]) / (x[1] - x[0])
                     low_mask = flat < x0
@@ -334,22 +350,19 @@ def calibrate(image, header, dark=None, crop=True, subtract=True, linearize=True
         else:
             if cfg and 'param1' in cfg and 'param2' in cfg:
                 param1, param2 = cfg['param1'], cfg['param2']
-
             else:
-                # print("No linearization for this chip")
                 param1, param2 = [0, 1, 0, 0], 0
 
-            # Keep linearization parmeters in the header
-            for _ in [0,1,2,3]:
+            # Store linearisation parameters in the header.
+            for _ in [0, 1, 2, 3]:
                 header['PARAM1_%d' % _] = param1[_]
             header['PARAM2'] = param2
 
             image = image.copy()
             B = np.log10(image[image > 1])
-            v1 = param1[0]*B + param1[1]
-            v2 = param1[2]*B + param1[3]
+            v1 = param1[0] * B + param1[1]
+            v2 = param1[2] * B + param1[3]
             v1[B < param2] += v2[B < param2]
-
             image[image > 1] /= v1
 
         header['LINEARIZ'] = 1

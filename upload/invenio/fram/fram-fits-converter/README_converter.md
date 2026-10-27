@@ -1,4 +1,4 @@
-# fram-fits-converter 0.3.0
+# fram-fits-converter 0.3.1
 
 Safe recursive FITS compression using the external `fpack` utility.
 
@@ -12,7 +12,9 @@ For every input file:
 2. Only the temporary copy is passed to `fpack`.
 3. The `.fz` produced by `fpack` is checked.
 4. It is published to `--destination` under the **same `.fits` filename**.
-5. Publication uses an atomic filesystem replace.
+5. Publication uses an atomic filesystem replace; if source and destination
+   are on different filesystems, a same-filesystem staging copy is used
+   before the final atomic rename.
 6. Temporary files are removed automatically.
 
 The destination is also forbidden from being inside the source root. This
@@ -35,6 +37,26 @@ Output:
 
 The output has the same filename, but contains the FITS tile-compressed data
 produced by `fpack`.
+
+## Path prefix
+
+The `--prefix` option (default: `data3`) controls the anchor that is
+preserved in the output tree. The following `--root` forms are all
+supported:
+
+| `--root` | result in `--destination` |
+|---|---|
+| `/mnt` | `<dest>/data3/auger/2017/…` |
+| `/mnt/data3` | `<dest>/data3/auger/2017/…` |
+| `/mnt/data3/auger/2017` | `<dest>/data3/auger/2017/…` |
+
+In every case the output path starts at the prefix, so the destination
+tree mirrors the archive layout from `data3` downward regardless of how
+deep `--root` points.
+
+If the prefix is absent from the path entirely, a `PrefixError` is raised
+(and the file is recorded as failed). Pass `--prefix ""` or restructure
+`--root` to avoid this.
 
 ## fpack executable
 
@@ -93,3 +115,7 @@ The final summary reports:
 - input/output compression ratio
 
 Per-file log messages also contain input size, output size and ratio.
+
+## License
+
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)

@@ -1,35 +1,48 @@
 #!/usr/bin/env python
+"""
+Aperture photometry pipeline for FRAM science frames.
 
-import os, sys, glob, datetime
+Processes individual FITS files: applies dark and flat calibration, performs
+astrometric refinement, detects sources, calibrates photometry against a
+reference catalogue, and stores per-object results as Parquet files in a
+mirrored directory tree.
+
+Usage:
+    python3 extract_photometry.py [options] file1.fits [file2.fits ...]
+
+Options:
+    -p / --photodir   Base directory for output Parquet files (default: photometry)
+    -D / --dark       Master dark frame
+    -F / --flat       Master flat frame
+    -C / --cat        Reference catalogue (Parquet)
+    -r / --replace    Overwrite existing output files
+    -v / --verbose    Verbose output
+
+Requires: astropy, numpy, scipy, stdpipe, statsmodels, calibrate.py
+"""
+
+import os
+import sys
+import datetime
+import warnings
 
 import numpy as np
 
-from astropy.wcs import WCS
+from astropy.wcs import WCS, FITSFixedWarning
 from astropy.io import fits
-
-import calibrate
-# import astroscrappy
-#import cPickle as pickle
-# import pickle
-
-from stdpipe import astrometry, photometry, pipeline, utils
-
-from astropy.table import Table, vstack
+from astropy.io.fits.verify import VerifyWarning
+from astropy.table import Table
 from astropy.stats import mad_std
-from astropy.coordinates import SkyCoord
-from astropy import units as u
 from astropy.time import Time
 
+import calibrate
+from stdpipe import astrometry, photometry, pipeline, utils
 
-# Disable some annoying warnings from astropy
-import warnings
-from astropy.wcs import FITSFixedWarning
-from astropy.io.fits.verify import VerifyWarning
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
 warnings.simplefilter(action='ignore', category=FITSFixedWarning)
 warnings.simplefilter(action='ignore', category=VerifyWarning)
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
-
-from statsmodels.tools.sm_exceptions import ConvergenceWarning
 warnings.simplefilter(action='ignore', category=ConvergenceWarning)
 
 
@@ -151,7 +164,7 @@ def process_file(filename, night=None, site=None, darkname=None, flatname=None, 
     else:
         flat = None
 
-    if dark is None:# or flat is None:
+    if dark is None:
         log("No master dark provided, exiting")
         save_objects(objname, None)
         return
@@ -176,8 +189,6 @@ def process_file(filename, night=None, site=None, darkname=None, flatname=None, 
 
     mask |= flat < 0.5 # Highly vignetted regions
 
-    cmask = np.zeros_like(mask)
-
     # WCS + catalogue
     wcs = WCS(header)
     pixscale = astrometry.get_pixscale(wcs=wcs)
@@ -196,12 +207,6 @@ def process_file(filename, night=None, site=None, darkname=None, flatname=None, 
         return
 
     log(f"{len(cat)} catalogue stars")
-
-    # Cosmic rays
-    if not 'WF' in ccd and False:
-        obj0 = photometry.get_objects_sep(image, mask=mask, wcs=wcs, minnthresh=3, edge=10, use_fwhm=True, sn=10, verbose=False)
-        cmask,cimage = astroscrappy.detect_cosmics(image0, inmask=mask, gain=gain, readnoise=10, psffwhm=np.median(obj0['fwhm']), satlevel=50000, verbose=False)
-        cimage /= gain
 
     mask_full = mask | smask | dmask
 

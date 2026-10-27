@@ -296,3 +296,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python3 fram_upload_with_retry.py --environment production --data-root "/mnt/data3/cta-n/2024" \
+#     --date-pattern "202404*" --max-concurrency 4

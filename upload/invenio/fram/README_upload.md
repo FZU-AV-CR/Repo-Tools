@@ -65,6 +65,18 @@ These two are **not** part of the generic engine's `--help` output — they're p
 |---|---|
 | `--date-pattern "202404*"` | Comma-separated glob pattern(s) matched against `YYYYMMDD` day-folder names, wherever they occur under `--data-root`. Applies across every site simultaneously (`cta-n`, `auger2`, ...) since it matches the folder name alone, not the full path. Omit entirely to upload every date. Example: `--date-pattern "202204*,202205*"` for April+May 2022. |
 | `--exclude-dirs "bad"` | Comma-separated glob pattern(s) matched against **any** directory name at **any** depth — matching folders are skipped entirely. **Defaults to `"bad"` even if you never pass this flag.** Pass `--exclude-dirs ""` explicitly to disable exclusion and upload everything, including `bad/` folders. |
+| `--require-wcs` | Reject `object`-type frames that have no valid astrometric solution (WCS) in their header, writing them to `errors.csv` as `E_NO_WCS` instead of uploading them without sky-position fields. Has no effect on calibration frames (`dark`, `flat`, `bias`, `masterdark`, `masterflat`, `dcurrent`) — those never carry a WCS. Off by default: without this flag, science frames without a WCS are uploaded normally, just without `center`, `radius`, `footprint` and related fields. |
+
+#### How bad frames are excluded — the two-stage quality gate
+
+FRAM observatories follow a convention of moving frames that failed astrometric solving into a subdirectory named `bad/` (done by the observatory control software or operators, outside this pipeline). The pipeline's default `--exclude-dirs bad` then silently prunes every such folder during the directory walk — the files are never read, extracted, or counted. This is the primary mechanism for excluding frames with hardware problems or poor observing conditions (clouds, tracking failures), since these are exactly the cases that cause the astrometric solver to fail.
+
+The result is a two-stage quality gate:
+
+1. **Observatory level** — frames without a valid astrometric solution are placed in `bad/` by the site software or operators.
+2. **Pipeline level** — `--exclude-dirs bad` (the default) skips all `bad/` folders during the walk.
+
+`--require-wcs` adds an optional third stage for cases where `bad/` sorting has not been done or is incomplete: it rejects any `object` frame that reaches the pipeline but still lacks a WCS, writing it to `errors.csv` rather than uploading it silently without sky-position metadata. For bulk historical uploads where you want to ingest everything available, leave this flag off. For ongoing ingestion of new frames, enabling it provides an additional safety net.
 
 ### Concurrency & transfer
 
@@ -190,5 +202,4 @@ python3 fram_upload.py --environment local --data-root "..." \
 
 - **`model="fram"`** and the schema handling are not independently confirmed against test1/production — `--disable-schema` sidesteps the schema question but not the model name.
 - **`--rate-limit` defaults** are Cesnet's reported numbers with a margin, not a guaranteed-safe value — confirm directly with Cesnet before a full bulk run, especially whether the limit can be raised or scoped to this job.
-- `access.embargo` in `fram_upload.py`'s metadata uses `{"active": "false", "reason": "null"}` (Python strings, not real booleans/None) — known, and deliberately left as-is.
-- `camera_serial` is read from the `CCD_SER` header keyword, while `calibrate.py`'s own calibration lookup keys off `header['product_id']` — these are independent and the latter can raise if that field isn't present on the header object `crop_overscans()` receives. Worth checking against a real file before a production run.
+- `camera_serial` is read from the `PRODUCT_ID` header keyword (HIERARCH, image HDU), the same keyword `calibrate.py`'s `find_calibration_config()` uses. If `PRODUCT_ID` is absent from the header object that `crop_overscans()` receives, the latter can raise — worth checking against a real file if that path is exercised.

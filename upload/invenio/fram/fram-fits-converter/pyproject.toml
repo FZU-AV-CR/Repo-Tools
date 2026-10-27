@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fram-fits-converter"
+version = "0.3.1"
+description = "Safe recursive FITS compression using fpack."
+readme = "README_converter.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+  {name = "FZU Institute of Physics of the Czech Academy of Sciences", email = "physics-support@e-infra.cz"},
+]
+
+[project.scripts]
+fram-convert = "fram_converter.cnv_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fram_converter*"]
