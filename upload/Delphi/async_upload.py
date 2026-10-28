@@ -215,7 +215,7 @@ def fill_cern_metadata(source) -> dict:
     }
 }
 
-    src = source.get("metadata", {})
+    src = source.get("metadata")
     tgt = metadata.get("metadata", {})
 
     # print(json.dumps(src, indent=2))
@@ -262,7 +262,7 @@ def fill_cern_metadata(source) -> dict:
     if primary:
         subjects.append({"subject": str(primary)})
     for item in src.get("collections", []):
-        # separate by -
+        # separate by - # TODO: test
         if "-" in str(item):
             for subitem in str(item).split("-"):
                 subjects.append({"subject": subitem.strip()})
@@ -304,7 +304,6 @@ def fill_cern_metadata(source) -> dict:
     elif isinstance(secondary, list) and any(str(s).lower() == "collision" for s in secondary):
         tgt["dataset_type"] = "collision"
     elif isinstance(secondary, list) and any(str(s).lower() == "logbook" for s in secondary):
-        # TODO: fix values
         tgt["dataset_type"] = "logbook"
         tgt["resource_type"] = {"id": "H41Y-FW7B"}  # logbook
         tgt.pop("collision_information", None)  # logbooks don't have collision info
@@ -327,7 +326,7 @@ def fill_cern_metadata(source) -> dict:
         return metadata
     elif isinstance(secondary, list) and any(str(s).lower() == "policy" for s in secondary):
         tgt["dataset_type"] = "policy"
-        tgt["resource_type"] = {"id": "c_186u"} # zpráva k politice nebo strategii
+        tgt["resource_type"] = {"id": "c_186u"} # policy or strategy report
         tgt.pop("collision_information", None)  # logbooks don't have collision info
         tgt.pop("number_of_events", None)  # logbooks don't have experiment field
         metadata["metadata"] = tgt
@@ -470,26 +469,22 @@ async def _upload_one_file(client, record, file_path: Path, sem: asyncio.Semapho
         )
 
 
-async def _write_stats(stats_path: Path | None, fmt: str, payload: dict, metadata: dict | None = None):
+async def _write_stats(stats_path: Path | None, fmt: str, payload: dict):
     if not stats_path:
         return
 
     def _sync_write():
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        row = dict(payload)
-        if metadata:
-            row.update(metadata)
         if fmt == "csv":
             write_header = not stats_path.exists()
             with stats_path.open("a", encoding="utf-8", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=sorted(row.keys()))
+                writer = csv.DictWriter(fh, fieldnames=sorted(payload.keys()))
                 if write_header:
                     writer.writeheader()
-                writer.writerow(row)
+                writer.writerow(payload)
         else:  # jsonl
             with stats_path.open("a", encoding="utf-8") as fh:
-                payload_with_metadata = dict(row)
-                fh.write(json.dumps(payload_with_metadata, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     await asyncio.to_thread(_sync_write)
 
@@ -499,6 +494,7 @@ async def upload_record_async(
     recid: int,
     data_dir: Path,
     metadata_dir: Path,
+    template_path: Path = Path("delphi_nrp_example.json"),
     file_concurrency: int = 4,
     upload_limiter: WeightedSemaphore | None = None,
     zip_sem: asyncio.Semaphore | None = None,
@@ -512,35 +508,33 @@ async def upload_record_async(
     error = None
     zip_used = False
     zip_path = None
-    dataset_files: list[Path] = []
     record = None
-    metadata = None
-    exc = None
+    dataset_files: list[Path] = []
     try:
         metadata_file = metadata_dir / f"{recid}.json"
         folder = data_dir / f"{recid}"
         if not metadata_file.exists():
             logger.warning("[%s] Missing metadata file: %s", recid, metadata_file)
-            raise ValueError("Missing metadata file")
+            raise FileNotFoundError(f"Missing metadata file: {metadata_file}")
         if not folder.exists():
             logger.warning("[%s] Missing dataset folder: %s", recid, folder)
-            raise ValueError("Missing dataset folder")
+            raise FileNotFoundError(f"Missing dataset folder: {folder}")
 
         dataset_files = [p for p in folder.glob("*") if p.is_file()]
         dataset_size = sum(p.stat().st_size for p in dataset_files if p.exists())
         logger.info("[%s] Found %s files in dataset folder, total size %.2f GB", recid, len(dataset_files), dataset_size / (1024 * 1024 * 1024))
 
-        with open(metadata_file, "r", encoding="utf-8") as fh:
-            source = json.load(fh)
+        with open(metadata_file, "r", encoding="utf-8") as file:
+            metadata = json.load(file)
 
         # Fill metadata template with actual values
-        metadata = fill_cern_metadata(source)
+        metadata = fill_cern_metadata(metadata)
         # print(json.dumps(metadata, indent=2))
 
         # Create a new record
         record = await client.records.create(
             metadata,
-            model="particles" , community= "test" # , community="my-community-slug", workflow="review"
+            model="particles", community="delphi" # , community="my-community-slug", workflow="review"
         )
         logger.info("[%s] Created record: %s", recid, record.id)
 
@@ -588,31 +582,14 @@ async def upload_record_async(
             tasks = [asyncio.create_task(_upload_one_file(client, record, fp, sem, upload_limiter)) for fp in dataset_files]
             await asyncio.gather(*tasks)
 
-        # published = await client.records.publish(record)
-        # logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
-        # return published
+        published = await client.records.publish(record)
+        logger.info("[%s] Published record: %s (%.2fs)", recid, published.id, time.perf_counter() - start)
+        return None
     except Exception as exc:
         status = "failed"
-        error = str(exc)
-        try:
-            await _write_stats(
-                stats_path,
-                stats_format,
-                {
-                    "recid": recid,
-                    "status": status,
-                    "error": error,
-                    "start_ts": start_ts,
-                    "duration_s": round(time.perf_counter() - start, 3),
-                    "file_count": len(dataset_files),
-                    "zip_used": zip_used,
-                    "url": str(record.links.self_html) if record else None,
-                },
-            )
-        except Exception:
-            logger.warning("[%s] Failed to write stats after error: %s", recid, exc, exc_info=True)
-        return exc
-
+        error = exc.__class__.__name__ + ": " + str(exc)
+        logger.exception("[%s] Upload failed: %s", recid, exc)
+        # return exc
     finally:
         bytes_uploaded = 0
         try:
@@ -622,13 +599,7 @@ async def upload_record_async(
             elif dataset_files:
                 bytes_uploaded = sum(p.stat().st_size for p in dataset_files if p.exists())
         except Exception:
-            logger.warning("[%s] Failed to calculate uploaded bytes", recid, exc_info=True)
-
-        metadata_source = {}
-        if record is not None:
-            metadata_source = record.metadata
-        elif isinstance(metadata, dict):
-            metadata_source = metadata.get("metadata", metadata)
+            pass
 
         await _write_stats(
             stats_path,
@@ -641,13 +612,11 @@ async def upload_record_async(
                 "duration_s": round(time.perf_counter() - start, 3),
                 "file_count": len(dataset_files),
                 "zip_used": zip_used,
-                "record_size": bytes_uploaded,
+                "bytes_uploaded": bytes_uploaded,
                 "url": str(record.links.self_html) if record else None,
             },
-            metadata=serialize_metadata(metadata_source),
         )
-
-    return None
+    return error
 
 
 def ensure_zip(dataset_files: list[Path], zip_path: Path):
@@ -706,9 +675,9 @@ async def main_async() -> None:
     # client = await create_local_client()
     # client = await create_prod_client()
 
-    recid = 85104
-    metadata_dir = Path("../metadata")
-    data_dir = Path("../data")
+    recid = 2
+    metadata_dir = Path("../../metadata")
+    data_dir = Path("../../data")
 
     await upload_record_async(
         client=client,
@@ -740,3 +709,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
