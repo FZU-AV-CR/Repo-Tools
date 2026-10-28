@@ -406,6 +406,59 @@ class RateLimiter:
             while dq and dq[0] < cutoff:
                 dq.popleft()
 
+    def seed_from_history(self, event_times_by_weight: list[tuple[float, int]]) -> int:
+        """Pre-populate this limiter's sliding-window history from past
+        WALL-CLOCK event timestamps (time.time()-style, e.g. read from a
+        previous run's stats CSV), so a freshly started process doesn't
+        forget how much of the server's real, shared budget was already
+        consumed recently. Without this, restarting the process (a crash,
+        a manual stop/resume, or bulk_async.py's own multi-pass retry
+        wrapper launching a new process for each pass) resets this
+        limiter's in-memory history to empty even though the SERVER's own
+        window hasn't actually reset -- the server doesn't know or care
+        that our client restarted. The result is a burst of requests right
+        after every restart that can trip the exact rate limit this
+        limiter exists to avoid.
+
+        Each entry is (wall_clock_time, weight) -- weight lets one
+        historical multipart transfer count for its real number of
+        requests, matching acquire(weight=N)'s own semantics. Call this
+        once, immediately after construction, before any acquire() calls.
+        Events older than the largest configured window are naturally
+        dropped (an event's age is compared against each window
+        individually, so it only seeds windows it's still within).
+        Returns the total weight actually seeded, for logging.
+
+        acquire()'s internal clock is time.monotonic() (immune to wall-clock
+        adjustments during a run), which has no fixed relationship to
+        time.time() -- so each historical event is converted via its AGE
+        (now_wall - event_wall_time), then placed that same age before
+        this process's own time.monotonic() origin, which is the only
+        thing that's actually comparable across the wall/monotonic clocks.
+        """
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        seeded = 0
+        for wall_ts, weight in event_times_by_weight:
+            weight = max(1, weight)
+            age = now_wall - wall_ts
+            if age < 0:
+                continue  # clock skew or a future timestamp -- ignore defensively
+            mono_ts = now_mono - age
+            added_to_any_window = False
+            for _, window in self.limits:
+                if age <= window:
+                    for _ in range(weight):
+                        self._events[window].append(mono_ts)
+                    added_to_any_window = True
+            if added_to_any_window:
+                seeded += weight
+        # _prune()/acquire()'s overflow math both assume each window's deque
+        # is sorted oldest-first; seeding may have appended out of order.
+        for _, window in self.limits:
+            self._events[window] = deque(sorted(self._events[window]))
+        return seeded
+
     async def acquire(self, weight: int = 1) -> None:
         weight = max(1, weight)
         while True:
@@ -797,6 +850,10 @@ async def upload_record_async(
     checksum_md5 = None
     published = None
     file_count = 0
+    # Must be initialised BEFORE the try: it is first assigned after extract_metadata(), but the
+    # finally block below reads it. If extraction raises (e.g. a transient I/O error), an unset
+    # zip_used turned the failure into UnboundLocalError and the 'failed' stats row was never written.
+    zip_used = False
 
     try:
         extracted = await asyncio.to_thread(adapter.extract_metadata, item)
