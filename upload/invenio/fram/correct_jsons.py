@@ -39,20 +39,17 @@ RESOURCE_TITLE = "FRAM Robotic Telescopes Data Collection"
 BASE_RECORD_URL = "https://test1.physics.du.cesnet.cz/fram/records"
 
 
-def correct_dates(value, output_date: str):
-    """Set every date-only string to output_date."""
-    if isinstance(value, dict):
-        for key, item in value.items():
-            value[key] = correct_dates(item, output_date)
+def correct_dates(data, output_date: str):
+    """Set metadata.publication_date to output_date.
 
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            value[index] = correct_dates(item, output_date)
-
-    elif isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        return output_date
-
-    return value
+    Only the publication_date field is updated. Observation dates stored under
+    metadata.dates[].date (e.g. the Created date from DATE-OBS) are left
+    unchanged — they carry scientific information and must not be overwritten.
+    """
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        metadata["publication_date"] = output_date
+    return data
 
 
 def find_fits_filename(value):
