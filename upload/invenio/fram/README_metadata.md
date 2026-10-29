@@ -270,17 +270,11 @@ These stay in the FITS header, which the portal shows unchanged.
 | `--require-wcs` | uploader, generator | rejects `object` frames without a valid WCS (→ `E_NO_WCS`); no effect on calibration frames. Off by default |
 | `--dry-run` | generator | runs extraction and validation without writing any JSON files. No effect on values |
 
-## 12. Known limitations and open items
+## 12. Known limitations
 
 1. **FWHM is approximate** (section 7) and depends on `--quality-size`, which is not stored.
 2. **`bias_level` is empty** for masters, for cameras whose raw shape is not in the crop table, and for headers without overscan.
-3. **`instrument` is inconsistent** between sites (`WF0`, `BART 254/1600 mm`, `FRAM`, `CTA-S1 FRAM`, `WF 4kx4k CCD`) because the observatory software fills `INSTRUME` differently. `pixel_scale` identifies the optics more reliably.
-4. **`observation_time` is truncated to seconds**, and `target` is the combined text. Both match the records already uploaded.
-
-7. **`identifiers`** holds only a URL (or an empty value). It is not a persistent identifier such as a DOI. Whether the repository assigns a DOI to each record is not decided by this code.
-8. **Records uploaded earlier** do not carry the new fields (`mean`, `median`, `robust_std`, `instrument`, `pixel_scale`, `ccd_temperature`, `air_temperature`, `bias_level`, `fwhm_*`) and may still contain `0.0` placeholders for calibration frames. They become consistent only after a new upload.
-9. **Night of observation** at `auger2` without `LONGITUD` uses an assumed longitude. The site-versus-longitude check only warns.
-
+3. **`observation_time` is truncated to seconds**, and `target` is the combined text. Both match the records already uploaded.
 
 ## 13. Example record
 
