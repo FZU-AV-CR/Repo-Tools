@@ -14,7 +14,7 @@ adapter file.
 | `async_upload.py` | Generic per-record pipeline: extract → validate → create → upload file → publish, plus the transfer/rate limiters. Shared across all models. |
 | `adapters.py` | Registry mapping a model name (`fram`, `itk`, `sipm`, `delphi`) to its adapter module. |
 | `calibrate.py` | FITS overscan-cropping/bias-subtraction used when computing FRAM metadata (not part of the uploaded file itself). |
-| `TEST_async_upload.py` | Standalone, self-contained single-file upload test — no imports from the files above. For quickly checking connectivity/schema/community/model handling against one FITS file before running the real pipeline. |
+
 
 ## Quick start
 
@@ -197,10 +197,4 @@ python3 fram_upload.py --environment local --data-root "..." \
   --disable-stats --disable-logs
 ```
 
----
 
-## Open items / things not yet confirmed
-
-- **`model="fram"`** and the schema handling are not independently confirmed against test1/production — `--disable-schema` sidesteps the schema question but not the model name.
-- **`--rate-limit` defaults** are Cesnet's reported numbers with a margin, not a guaranteed-safe value — confirm directly with Cesnet before a full bulk run, especially whether the limit can be raised or scoped to this job.
-- `camera_serial` is read from the `PRODUCT_ID` header keyword (HIERARCH, image HDU), the same keyword `calibrate.py`'s `find_calibration_config()` uses. If `PRODUCT_ID` is absent from the header object that `crop_overscans()` receives, the latter can raise — worth checking against a real file if that path is exercised.

@@ -276,12 +276,11 @@ These stay in the FITS header, which the portal shows unchanged.
 2. **`bias_level` is empty** for masters, for cameras whose raw shape is not in the crop table, and for headers without overscan.
 3. **`instrument` is inconsistent** between sites (`WF0`, `BART 254/1600 mm`, `FRAM`, `CTA-S1 FRAM`, `WF 4kx4k CCD`) because the observatory software fills `INSTRUME` differently. `pixel_scale` identifies the optics more reliably.
 4. **`observation_time` is truncated to seconds**, and `target` is the combined text. Both match the records already uploaded.
-5. **The uploader writes `related_resources` with the root collection DOI** for every record. Site-year specific resources will be managed through repository collections in the production environment.
-6. **Typos in the constant texts** ("atmospheric" in `subjects`, "Photometric" in the abstract) are kept so that new records match those already uploaded.
+
 7. **`identifiers`** holds only a URL (or an empty value). It is not a persistent identifier such as a DOI. Whether the repository assigns a DOI to each record is not decided by this code.
 8. **Records uploaded earlier** do not carry the new fields (`mean`, `median`, `robust_std`, `instrument`, `pixel_scale`, `ccd_temperature`, `air_temperature`, `bias_level`, `fwhm_*`) and may still contain `0.0` placeholders for calibration frames. They become consistent only after a new upload.
 9. **Night of observation** at `auger2` without `LONGITUD` uses an assumed longitude. The site-versus-longitude check only warns.
-10. **Verification status.** The code was tested on nine real files (G2 and G4 cameras, compressed and plain, 1×1 and 2×2, science, raw dark, master dark, master flat) **Not yet tested:** the CMOS camera (serial 80011), fields containing a pole or crossing RA 0°, science frames without a WCS in real data, master frames, and a full run over the whole archive.
+
 
 ## 13. Example record
 

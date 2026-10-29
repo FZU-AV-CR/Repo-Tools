@@ -25,7 +25,7 @@ The project focuses on:
 
 The FRAM pipeline (`upload/invenio/`) processes and archives observation data from the FRAM robotic telescopes (Photometric Robotic Atmospheric Monitor) operated by FZU Institute of Physics of the Czech Academy of Sciences. It extracts and validates metadata from FITS files, enriches it with image-derived quantities (FWHM, sky position, image statistics), and publishes records to the [Physica](https://invenio.fzu.cz) repository.
 
-See [`upload/invenio/README_fram.md`](upload/invenio/README_fram.md) for full documentation.
+See `upload/invenio/fram/README_fram.md` for further documentation.
 
 ## Requirements
 
