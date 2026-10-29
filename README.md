@@ -23,6 +23,9 @@ The project focuses on:
 
 ## FRAM Data Pipeline
 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/fzu-av-cr/repo-tools?utm_source=readme&utm_medium=badge)
+[![Architecture diagram of fzu-av-cr/repo-tools](https://gitdiagram.com/fzu-av-cr/repo-tools/diagram.png)](https://gitdiagram.com/fzu-av-cr/repo-tools?utm_source=readme&utm_medium=picture)
+
 The FRAM pipeline (`upload/invenio/`) processes and archives observation data from the FRAM robotic telescopes (Photometric Robotic Atmospheric Monitor) operated by FZU Institute of Physics of the Czech Academy of Sciences. It extracts and validates metadata from FITS files, enriches it with image-derived quantities (FWHM, sky position, image statistics), and publishes records to the Physics repository.
 
 See `upload/invenio/fram/README_fram.md` for further documentation.
