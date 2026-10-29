@@ -3,7 +3,7 @@ title: FRAM Data Pipeline
 message: "If you use this software, please cite it using the metadata from this file."
 type: software
 license: Apache-2.0
-version: 1.0.0
+version: 1.2.2
 date-released: "2026-10-29"
 abstract: >
   Software for processing and archiving observation data from the FRAM robotic
