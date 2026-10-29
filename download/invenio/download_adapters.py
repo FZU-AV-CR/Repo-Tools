@@ -1,43 +1,26 @@
 """
-Registry of metadata-model "adapters" for the shared async_download.py /
-bulk_download.py download engine.
+Registry of metadata-model adapters for the download engine.
 
-Much thinner than upload's adapters.py, because downloading doesn't need
-per-model metadata extraction/validation/building -- see async_download.py's
-module docstring for why. All a download adapter provides is:
+Each adapter is a module (fram_download.py, delphi_download.py, ...) that
+sets three constants:
 
-    MODEL_NAME          -> str   # nrp-cmd `model` search param for this
-                                  # metadata model (passed to
-                                  # published_records.search()/scan()/read())
-    DEFAULT_OUTPUT_DIR  -> str   # where files land if --output-dir isn't given
-    DEFAULT_QUERY       -> str | None   # optional default OpenSearch filter,
-                                  # ANDed with anything the user passes via
-                                  # --query/--filter/--year/... on top
+    MODEL_NAME         str        nrp-cmd `model` search parameter, used to
+                                  pick the right search/scan URL from the
+                                  repository's .well-known/repository endpoint.
+    DEFAULT_OUTPUT_DIR str|None   where files land if --output-dir is not given.
+    DEFAULT_QUERY      str|None   optional default OpenSearch filter, ANDed with
+                                  any --query/--filter/--year/... the user adds.
 
-Selecting the adapter at runtime works exactly like upload's:
-  - via the --adapter CLI flag (see bulk_download.py), or
-  - via the PHYSICS_DOWNLOAD_ADAPTER environment variable, which each
-    model's own entry-point script (fram_download.py, delphi_download.py,
-    sipm_download.py, itk_download.py) sets for itself before handing off
-    to bulk_download.py.
+The active adapter is selected via --adapter (bulk_download.py's CLI flag)
+or the PHYSICS_DOWNLOAD_ADAPTER environment variable. Each model's entry-
+point script sets the latter before calling bulk_download.main(), so
+`python3 fram_download.py ...` just works.
 
-Adding a new metadata model:
-  1. Write <model>_download.py setting MODEL_NAME / DEFAULT_OUTPUT_DIR /
-     DEFAULT_QUERY, plus the same _run_via_bulk_download() CLI-entry-point
-     boilerplate as fram_download.py.
-  2. Add one line to ADAPTERS below mapping a short name to the module name.
-That's it -- async_download.py and bulk_download.py need no further changes.
-
-NOTE on MODEL_NAME vs. upload's community/model kwargs: async_upload.py's
-adapters mostly identify their target via a *community* slug (e.g. FRAM's
-"community": "fram") rather than nrp-cmd's `model` search parameter, and
-the one adapter that does set upload's model= kwarg (Delphi) uses
-model="particles", not "delphi". Repository "model" (used to pick the
-right search/scan URL out of the well-known endpoint's info.models dict)
-and community slug are related but not always identical strings -- the
-MODEL_NAME values below are this pipeline's best-confirmed guess per model;
-each one is flagged where it hasn't been verified against a live
-`.well-known/repository` response yet.
+To add a new metadata model:
+  1. Create <model>_download.py setting the three constants above, plus the
+     same _run_via_bulk_download() boilerplate as fram_download.py.
+  2. Add one line to ADAPTERS below.
+No changes to async_download.py or bulk_download.py are needed.
 """
 
 from __future__ import annotations
@@ -63,10 +46,9 @@ def available() -> list[str]:
 
 
 def resolve_name(explicit: str | None = None) -> str:
-    """Figure out which adapter to use: explicit arg -> PHYSICS_DOWNLOAD_ADAPTER
-    env var -> raise. Deliberately no silent fallback -- downloading the
-    wrong model's records to the wrong folder is a worse failure mode than
-    an explicit, immediate error.
+    """Resolve which adapter to use: explicit arg -> PHYSICS_DOWNLOAD_ADAPTER
+    env var -> raise. No silent fallback: downloading the wrong model's
+    records to the wrong folder is a worse failure mode than a clear error.
     """
     name = explicit or os.environ.get(ENV_VAR)
     if not name:
