@@ -151,7 +151,8 @@ DEFAULT_EXCLUDE_DIRS = ["bad"]
 # Quality measurement via SEP (Source Extractor Python).
 # --no-quality disables star detection; --quality-size sets the central window.
 QUALITY_DISABLED_ENV_VAR = "FRAM_NO_QUALITY"
-REQUIRE_WCS_ENV_VAR = "FRAM_REQUIRE_WCS"   # --require-wcs: reject object frames without WCS
+REQUIRE_WCS_ENV_VAR = "FRAM_REQUIRE_WCS"         # --require-wcs: reject object frames without WCS
+PRESET_IDENTIFIER_ENV_VAR = "FRAM_PRESET_IDENTIFIER"  # --preset-identifier: pre-fill record URL
 MIN_STARS_FOR_FWHM = 20       # fewer clean stars → fwhm left empty (cloudy / empty field)
 SEP_DETECT_SIGMA = 5.0
 QUALITY_SIZE_ENV_VAR = "FRAM_QUALITY_SIZE"
@@ -907,10 +908,24 @@ def build_invenio_metadata(extracted: dict) -> dict:
                 ),
             }
         ],
-        # Landing-page URL: async_upload.py replaces this placeholder with the
-        # real record URL after creation. The base URL below targets the test
-        # environment and will be updated for production deployment.
-        "identifiers": [{"identifier": "https://test1.physics.du.cesnet.cz/fram/records/" + Path(extracted["site"]).stem + "-" + Path(extracted["filename"]).stem.removesuffix("-RA"), "scheme": "url"}],
+        # Landing-page URL identifier.
+        # async_upload.py looks for a {"identifier": "", "scheme": "url"} entry
+        # and fills it with the record's own landing-page URL after creation.
+        # Default (direct upload): empty string placeholder — Invenio assigns its
+        # own record ID and async_upload.py writes it back to the draft.
+        # With --preset-identifier: pre-filled as site-filename URL for bulk/Cesnet
+        # import flows where the landing-page URL can be constructed in advance.
+        "identifiers": [
+            {
+                "identifier": (
+                    "https://test1.physics.du.cesnet.cz/fram/records/"
+                    + Path(extracted["site"]).stem
+                    + "-"
+                    + Path(extracted["filename"]).stem.removesuffix("-RA")
+                ) if os.environ.get(PRESET_IDENTIFIER_ENV_VAR) else "",
+                "scheme": "url",
+            }
+        ],
         # Root collection DOI. Site-year specific resources will be linked via
         # repository collections in the production environment.
         "related_resources": [{"title": "FRAM Robotic Telescopes Data Collection", "identifiers": [{"identifier": "https://doi.org/10.83100/ddxy-p647", "scheme": "url"}], "relation_type": {"id": "IsPartOf"}}],
@@ -1094,6 +1109,13 @@ def _run_via_bulk_async() -> None:
         os.environ[REQUIRE_WCS_ENV_VAR] = "1"
         argv_rest = [a for a in argv_rest if a != "--require-wcs"]
 
+    # --preset-identifier: pre-fill site-filename URL in identifiers field.
+    # For bulk/Cesnet import flows. Default (direct upload): identifiers is
+    # left empty and Invenio assigns its own record ID after creation.
+    if "--preset-identifier" in argv_rest:
+        os.environ[PRESET_IDENTIFIER_ENV_VAR] = "1"
+        argv_rest = [a for a in argv_rest if a != "--preset-identifier"]
+
     extract_conc = _extract_flag_value(argv_rest, "--extract-concurrency")
     if extract_conc is not None:
         os.environ["FRAM_EXTRACT_CONCURRENCY"] = extract_conc
@@ -1151,3 +1173,7 @@ if __name__ == "__main__":
 #   # Reject object frames without a WCS (writes E_NO_WCS to stats CSV instead of uploading
 #   # without sky-position fields). No effect on calibration frames (dark/flat/bias/...):
 #   python3 fram_upload.py --environment local --data-root "..." --require-wcs
+#
+#   # Pre-fill the record URL identifier as site-filename (for bulk/Cesnet import flows).
+#   # Without this flag (default), identifiers is left empty and Invenio assigns its own ID:
+#   python3 fram_upload.py --environment local --data-root "..." --preset-identifier

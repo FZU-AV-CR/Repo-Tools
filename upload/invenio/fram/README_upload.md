@@ -57,15 +57,16 @@ python3 fram_upload.py --environment test1 --data-root "..." --dry-run
 | `--token TOKEN` | API token. **Prefer the `INVENIO_TOKEN` environment variable** — a token on the command line leaks into shell history and process listings. Use `--token` only when that's genuinely more convenient (e.g. inside a loop script that already handles the token itself). |
 | `--yes` | Skip the interactive `production` confirmation prompt. Needed for unattended/scripted production runs. |
 
-### Filtering what gets uploaded (FRAM-specific)
+### FRAM-specific flags
 
-These two are **not** part of the generic engine's `--help` output — they're parsed directly out of the command line by `fram_upload.py` itself and won't show up if you run `python3 fram_upload.py --help` (that only lists the generic engine's flags). Both prune the directory walk itself, so a non-matching folder's files are never even touched — important at FRAM's scale.
+These flags are **not** part of the generic engine's `--help` output — they're parsed directly out of the command line by `fram_upload.py` itself and won't show up if you run `python3 fram_upload.py --help` (that only lists the generic engine's flags).
 
 | Flag | Meaning |
 |---|---|
 | `--date-pattern "202404*"` | Comma-separated glob pattern(s) matched against `YYYYMMDD` day-folder names, wherever they occur under `--data-root`. Applies across every site simultaneously (`cta-n`, `auger2`, ...) since it matches the folder name alone, not the full path. Omit entirely to upload every date. Example: `--date-pattern "202204*,202205*"` for April+May 2022. |
 | `--exclude-dirs "bad"` | Comma-separated glob pattern(s) matched against **any** directory name at **any** depth — matching folders are skipped entirely. **Defaults to `"bad"` even if you never pass this flag.** Pass `--exclude-dirs ""` explicitly to disable exclusion and upload everything, including `bad/` folders. |
 | `--require-wcs` | Reject `object`-type frames that have no valid astrometric solution (WCS) in their header, writing them to `errors.csv` as `E_NO_WCS` instead of uploading them without sky-position fields. Has no effect on calibration frames (`dark`, `flat`, `bias`, `masterdark`, `masterflat`, `dcurrent`) — those never carry a WCS. Off by default: without this flag, science frames without a WCS are uploaded normally, just without `center`, `radius`, `footprint` and related fields. |
+| `--preset-identifier` | Pre-fill the record's `identifiers` field with a URL constructed as `base-url/site-filename` before the record is created. Intended for **bulk/Cesnet import flows** where the landing-page URL can be determined in advance. **Off by default**: without this flag, `identifiers` is left empty and Invenio assigns its own record ID after creation — this is the correct behaviour for direct uploads via this pipeline. |
 
 #### How bad frames are excluded — the two-stage quality gate
 
