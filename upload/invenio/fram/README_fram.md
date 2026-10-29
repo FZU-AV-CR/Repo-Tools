@@ -6,7 +6,7 @@ Auger (Argentina) and CTA-S (Paranal, Chile).
 
 The pipeline extracts metadata from FITS observation files, validates and enriches
 it with image-derived quantities (FWHM, sky position, image statistics), and
-publishes records to the [Physica](https://invenio.fzu.cz) repository
+publishes records to the Physics repository
 (InvenioRDM).
 
 ---
