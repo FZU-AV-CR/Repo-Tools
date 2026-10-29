@@ -1,7 +1,5 @@
 # Dataset Toolkit
 
-## Warning: This is a work in progress and not yet ready for production use. The code and documentation are evolving rapidly.
-
 Tools for downloading, preparing, transforming, and uploading large scientific datasets and metadata to NRP/Invenio using async workflows.
 
 The project focuses on:
@@ -14,6 +12,7 @@ The project focuses on:
 ## Main Features
 
 - Download from CERN Open Data Portal via xrootd
+- FRAM and other physical data pipeline
 - Async uploader for a single record
 - Bulk uploader that uses the single file uploader with prioritization and concurrency limits
 - Metadata filling/transformation into Delphi-style output
@@ -21,6 +20,12 @@ The project focuses on:
 - Concurrency limits (weighted uploads, controlled zip workers)
 - Structured performance logs for monitoring long-running jobs
 - Notebook-based analysis and visualization (including Sankey charts)
+
+## FRAM Data Pipeline
+
+The FRAM pipeline (`upload/invenio/`) processes and archives observation data from the FRAM robotic telescopes (Photometric Robotic Atmospheric Monitor) operated by FZU Institute of Physics of the Czech Academy of Sciences. It extracts and validates metadata from FITS files, enriches it with image-derived quantities (FWHM, sky position, image statistics), and publishes records to the [Physica](https://invenio.fzu.cz) repository.
+
+See [`upload/invenio/README_fram.md`](upload/invenio/README_fram.md) for full documentation.
 
 ## Requirements
 
