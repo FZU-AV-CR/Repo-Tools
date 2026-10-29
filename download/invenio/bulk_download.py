@@ -1,40 +1,25 @@
 """
 Generic bulk async orchestrator for Physics-repository downloads.
 
-This is the shared engine, not a standalone script -- it's driven by a
-model-specific entry point (fram_download.py, delphi_download.py,
-sipm_download.py, itk_download.py, ...), which fills in that model's
-MODEL_NAME/default output dir and calls bulk_download.main(). Running this
-file directly (`python3 bulk_download.py`) raises an error pointing to the
-correct entry point instead -- same convention as bulk_async.py.
+This is the shared engine, not a standalone script. Run one of the
+model-specific entry points instead (fram_download.py, delphi_download.py,
+sipm_download.py, itk_download.py); each fills in its MODEL_NAME and
+default output directory, then calls bulk_download.main(). Running this
+file directly raises an error pointing to the correct entry point.
 
-Mirrors bulk_async.py as closely as the download direction allows: resume
-via a stats CSV, bounded concurrency, a shared transfer-weight budget, the
-same rate/cooldown circuit breaker, graceful shutdown on SIGINT/SIGTERM,
-periodic progress logging, and a --dry-run mode that skips repository
-client setup entirely (no network/token needed).
+Features: resume via a per-file stats CSV, bounded concurrency, a shared
+transfer-weight budget for large files, a sliding-window circuit breaker,
+graceful shutdown on SIGINT/SIGTERM, and periodic progress logging.
+--dry-run performs record and file listing (read-only) but skips transfers.
 
-Differences from bulk_async.py:
-  - "items" here are individual FILES (see async_download.py's module
-    docstring for why), discovered by first selecting records (--ids/
-    --ids-file, or a --query/--filter/--year/... search) and then listing
-    each record's files, rather than a filesystem walk.
-  - record selection + file listing (async_download.resolve_records() /
-    list_download_items()) needs the repository client even for a
-    --dry-run *count*, unlike upload's filesystem-based discover_items();
-    --dry-run here still performs record/file listing (read-only calls)
-    but skips every actual download.
-  - CircuitBreaker/ProgressTracker/shutdown-handling/"final outcome"
-    reporting are reproduced here rather than imported from bulk_async.py,
-    so that Download/ stays deployable without also requiring Upload/ on
-    sys.path (same reasoning as async_download.py's WeightedSemaphore).
-    Keep the two in sync by hand if one is improved.
+The work unit is one file, not one record, since a record can carry
+several files and per-file progress tracking gives finer resume granularity.
+Record selection uses --ids/--ids-file for explicit lists, or a combination
+of --query/--filter/--year/--created-from/--created-to for a search.
 
-The adapter itself is resolved at runtime by download_adapters.py, from
---adapter (this file's own CLI flag) or the PHYSICS_DOWNLOAD_ADAPTER
-environment variable. Each model's entry-point script sets one of these
-for you. To add a new metadata model, see download_adapters.py -- no
-changes needed here.
+The adapter is resolved at runtime by download_adapters.py, from --adapter
+or the PHYSICS_DOWNLOAD_ADAPTER environment variable. To add a new metadata
+model, see download_adapters.py -- no changes needed here.
 """
 
 from __future__ import annotations
@@ -58,8 +43,7 @@ TERMINAL_STATUSES = {"ok", "failed", "skipped_exists", "dryrun"}
 
 
 # ============================================================
-# RESUME / INTERRUPTED-RUN DETECTION  (same logic as bulk_async.py's
-# _scan_stats, keyed off the "key" column -- here key = "record:file")
+# RESUME / INTERRUPTED-RUN DETECTION
 # ============================================================
 
 
@@ -138,8 +122,7 @@ def summarize_final_outcomes(stats_path: Path) -> dict[str, list[str]]:
 
 
 # ============================================================
-# CIRCUIT BREAKER  (identical design to bulk_async.py's -- see its
-# docstring for the full state-machine rationale)
+# CIRCUIT BREAKER
 # ============================================================
 
 
@@ -253,7 +236,7 @@ class CircuitBreaker:
 
 
 # ============================================================
-# PROGRESS TRACKING  (unchanged from bulk_async.py)
+# PROGRESS TRACKING
 # ============================================================
 
 
@@ -300,7 +283,7 @@ class ProgressTracker:
 
 
 # ============================================================
-# GRACEFUL SHUTDOWN  (unchanged from bulk_async.py)
+# GRACEFUL SHUTDOWN
 # ============================================================
 
 
@@ -330,7 +313,7 @@ def _request_shutdown(stop_event: asyncio.Event, sig) -> None:
 
 
 # ============================================================
-# PER-ITEM RETRY WRAPPER  (unchanged shape from bulk_async.py)
+# PER-ITEM RETRY WRAPPER
 # ============================================================
 
 
@@ -412,7 +395,14 @@ async def main_async(args: argparse.Namespace) -> None:
             async_download.TOKEN_ENV_VAR,
         )
 
-    output_dir = Path(args.output_dir or adapter.DEFAULT_OUTPUT_DIR)
+    _output_dir = args.output_dir or getattr(adapter, "DEFAULT_OUTPUT_DIR", None)
+    if not _output_dir:
+        logger.error(
+            "No output directory specified. Pass --output-dir /path/to/destination "
+            "(this adapter has no DEFAULT_OUTPUT_DIR set)."
+        )
+        return
+    output_dir = Path(_output_dir)
     stats_path = Path(args.stats_path or (output_dir / "download_stats.csv"))
     metadata_dir = None if args.no_metadata else (output_dir / "_metadata")
 
@@ -608,7 +598,7 @@ def parse_args() -> argparse.Namespace:
                            "--filter-regex metadata.target='M[0-9]+' . OpenSearch/Lucene regex syntax "
                            "(similar to but not identical to Python re -- no lookaround); escape a literal "
                            "'/' in the pattern as \\/.")
-    sel.add_argument("--year", type=int, default=None, help="Convenience filter: records created in this year.")
+    sel.add_argument("--year", type=int, default=None, help="Convenience filter: records whose date field falls in this year (see --date-field).")
     sel.add_argument("--created-from", "--created-after", dest="created_after", default=None,
                       help="Only records created on/after this ISO date (inclusive), e.g. 2026-01-01")
     sel.add_argument("--created-to", "--created-before", dest="created_before", default=None,

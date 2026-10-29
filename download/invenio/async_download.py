@@ -1,51 +1,18 @@
 """
-Generic async download engine for a single Physics-repository record's
-files.
+Per-file async download primitives for the Physics repository.
 
-Mirrors the shape of async_upload.py (this pipeline's upload counterpart)
-as closely as the download direction allows:
-  - same ENVIRONMENTS dict (local/test1/production), same alias/URL/
-    verify_tls values, same TOKEN_ENV_VAR ("INVENIO_TOKEN") and token
-    resolution order (explicit -> env var -> interactive prompt -- never
-    hardcoded), same typed-"PRODUCTION"-to-confirm client factory for the
-    production environment.
-  - same WeightedSemaphore transfer-budget concept: a large/multi-part
-    download counts for more of the shared in-flight-bytes budget than a
-    small single-shot one, independent of --max-concurrency (which only
-    bounds how many *items* are being processed at once). See bulk_download
-    .py's --transfer-weight-budget.
-  - same per-item stats-row shape/idea as async_upload.py's
-    upload_record_async()/_write_stats(), just for downloads. bulk_download
-    .py's resume/retry/circuit-breaker/progress logic all key off this.
+Provides: environment/client configuration (local/test1/production),
+token resolution, per-file download with size-based resume, optional
+multi-part parallel GET for large files, stats row writing, and record/
+file selection helpers used by bulk_download.py.
 
-Differences from async_upload.py, because downloading is a different shape
-of problem than uploading:
-  - the unit of work here is one FILE, not one record. A record can carry
-    several files (e.g. Delphi/particles), and main.py (the CERN Open Data
-    downloader this pipeline replaces for the Physics repository) tracked
-    progress/retries per file too, not per record -- keeping that grain
-    means an interrupted run resumes without re-fetching files that had
-    already finished, even if a sibling file in the same record failed.
-  - no adapter/metadata-model-building step: there is nothing to "extract"
-    or "validate" on the way down, so there is no adapters.py-style
-    interface to implement per model. What DOES vary per model is which
-    records to select in the first place (its repository "model" name and,
-    optionally, a default query) -- see download_adapters.py, which is a
-    much thinner registry than adapters.py because of this.
-  - resume-safe by default even without a stats CSV: a file that already
-    exists locally with the expected size is skipped before any network
-    call is made (see already_downloaded()). The stats CSV is still what
-    bulk_download.py's resume logic (interrupted-run detection, circuit
-    breaker inputs, --dry-run planning) is keyed off, same as upload.
-  - big files use nrp-cmd's own multi-part parallel GET (parts=/part_size=)
-    instead of the S3 multipart-upload transfer_type="M" mechanism -- the
-    MULTIPART_THRESHOLD_BYTES/MULTIPART_WEIGHT split below is the download
-    analogue of async_upload.py's, tuned higher since FRAM FITS frames and
-    Delphi payloads run much larger than typical upload attachments.
+The work unit is one file, not one record. A record can carry several
+files, and per-file tracking means an interrupted run resumes without
+re-fetching files that already completed, even if a sibling file in the
+same record failed.
 
-ENVIRONMENTS is defined *here*, not in any adapter, since the Physics-
-repository endpoints are shared across models -- same rationale as
-async_upload.py.
+Environments are defined here (not in any adapter) because the repository
+endpoints are shared across all metadata models.
 """
 
 from __future__ import annotations
@@ -76,9 +43,6 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 # ENVIRONMENT / CLIENT CONFIGURATION
-# (identical values to async_upload.py -- same repository, same
-# deployments, just a different token in practice since download tokens
-# can be scoped read-only)
 # ============================================================
 
 TOKEN_ENV_VAR = "INVENIO_TOKEN"
@@ -132,8 +96,7 @@ STATS_FIELDS = (
 
 def _resolve_token(token: str | None = None) -> str:
     """Resolve an API token: explicit arg -> INVENIO_TOKEN env var ->
-    interactive prompt. Never hardcode tokens in source (nrplib_download.py
-    did; that's the thing this fixes)."""
+    interactive prompt. Never hardcoded."""
     if token:
         return token
     env_token = os.environ.get(TOKEN_ENV_VAR)
@@ -207,9 +170,6 @@ async def create_client_for_environment(
 
 # ============================================================
 # TRANSFER LIMITER
-# (same WeightedSemaphore class as async_upload.py, duplicated rather than
-# imported so Download/ stays deployable on its own without also needing
-# Upload/ on sys.path -- see download_adapters.py for the same choice.)
 # ============================================================
 
 
@@ -253,12 +213,10 @@ async def _maybe_weighted_slot(limiter: "WeightedSemaphore | None", weight: int 
         yield
 
 
-# Files at or above this size use nrp-cmd's multi-part parallel GET instead
-# of a single-stream download, and count for MULTIPART_WEIGHT of the
-# shared transfer budget instead of 1. Higher than async_upload.py's 10 MB
-# upload threshold on purpose -- FRAM FITS frames and Delphi payloads are
-# typically much larger than what gets uploaded per-call, so a low
-# threshold here would put almost everything on the multi-part path.
+# Files at or above this size use nrp-cmd's multi-part parallel GET and
+# count for MULTIPART_WEIGHT of the shared transfer budget instead of 1.
+# 200 MiB is appropriate for FRAM FITS frames and Delphi payloads, which
+# are typically much larger than individual upload attachments.
 MULTIPART_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MiB
 MULTIPART_WEIGHT = 5
 DEFAULT_PARTS = 4
@@ -299,10 +257,9 @@ async def _write_stats(stats_path: Path, stats_format: str, payload: dict[str, A
 
 
 def already_downloaded(target: Path, expected_size: int | None) -> bool:
-    """Size-based resume check -- cheap enough to run before every file,
-    even at FRAM/Delphi scale. Pass verify_checksum=True on
-    download_file_async() for an (opt-in, slower) hash-based re-check of
-    files that already pass this test."""
+    """Size-based resume check, cheap enough to run before every download.
+    Pass verify_checksum=True on download_file_async() for an opt-in
+    hash-based re-check of files that already pass this test."""
     if not target.exists():
         return False
     if expected_size is None:
@@ -320,9 +277,7 @@ def already_downloaded(target: Path, expected_size: int | None) -> bool:
 
 @dataclass
 class DownloadItem:
-    """One file to fetch. The unit of work bulk_download.py's resume/
-    retry/circuit-breaker/progress machinery operates on -- see module
-    docstring for why this is file-level, not record-level."""
+    """One file to fetch. The unit of work for resume, retry, and progress tracking."""
 
     key: str  # f"{record_id}:{file_key}", unique + stable across runs
     record_id: str
@@ -347,14 +302,9 @@ async def download_file_async(
     max_attempts: int = 1,
 ) -> bool:
     """Download one file. Returns True if the file is now present and
-    correct locally (whether by downloading it just now or because it was
-    already there), False/raises on failure.
-
-    Mirrors async_upload.py's upload_record_async() in spirit: single
-    attempt (bulk_download.py's retry wrapper handles re-attempts and
-    writes the "started" row), always writes a terminal stats row in a
-    finally block, converts repository error payloads to readable text.
-    """
+    correct locally (whether just downloaded or already present). Raises
+    on failure; bulk_download.py's retry wrapper handles re-attempts.
+    Always writes a terminal stats row in a finally block."""
     start = time.perf_counter()
     start_ts = time.time()
     status = "failed"
@@ -532,18 +482,15 @@ def build_query(*, query: str | None, filters: list[str], ranges: list[str] | No
 async def resolve_records(
     client: Any, *, model: str, ids: list[str] | None, query: str | None,
 ) -> list[Any]:
-    """Return the list of Record objects to process: either the explicit
-    `ids` list (read one by one), or every record matching `query` for
-    `model` via the library's own scan() (paginates + date-bisects past
-    ~5000 hits automatically -- safe to point at a whole community).
+    """Return the list of records to process: either the explicit `ids`
+    list (read one by one), or every record matching `query` for `model`
+    via scan() (paginates and date-bisects past the ~5000-hit limit
+    automatically -- safe to point at a whole community).
 
-    Materializes the full list rather than streaming it, mirroring
-    async_upload.py/bulk_async.py's discover_items() -> list[item] shape
-    (needed for resume filtering + an accurate progress total). At true
-    FRAM/Delphi full-community scale (potentially millions of records) this
-    trades some memory for that simplicity/consistency; if that becomes a
-    real constraint, narrow the run with --filter/--year/--created-after
-    /--created-before, or split it into several --ids-file batches.
+    The full list is materialised in memory before any downloading begins,
+    which is needed for resume filtering and an accurate progress total.
+    At very large scale, narrow the run with --filter/--year/--created-from
+    /--created-to, or split it into --ids-file batches.
     """
     if ids:
         records = []
