@@ -259,10 +259,15 @@ async def _write_stats(stats_path: Path, stats_format: str, payload: dict[str, A
 def already_downloaded(target: Path, expected_size: int | None) -> bool:
     """Size-based resume check, cheap enough to run before every download.
     Pass verify_checksum=True on download_file_async() for an opt-in
-    hash-based re-check of files that already pass this test."""
+    hash-based re-check of files that already pass this test.
+
+    A size of 0 is treated as unknown (same as None): some repositories
+    do not populate file sizes in record metadata, so 0 cannot be
+    distinguished from a genuinely empty file without a checksum check.
+    """
     if not target.exists():
         return False
-    if expected_size is None:
+    if not expected_size:  # None or 0 -- size unknown
         return True
     try:
         return target.stat().st_size == expected_size
@@ -366,7 +371,7 @@ async def download_file_async(
             )
 
         bytes_downloaded = item.target_path.stat().st_size
-        if expected_size is not None and bytes_downloaded != expected_size:
+        if expected_size and bytes_downloaded != expected_size:  # skip check if size unknown (None or 0)
             raise IOError(f"size mismatch: expected {expected_size}, got {bytes_downloaded}")
 
         status = "ok"
