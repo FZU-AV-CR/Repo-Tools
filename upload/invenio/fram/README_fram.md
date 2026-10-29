@@ -1,15 +1,13 @@
 # FRAM Data Pipeline
 
 Software for processing and archiving data from the FRAM robotic telescopes
-(Photometric Robotic Atmospheric Monitor) operated by FZU — Institute of Physics
-of the Czech Academy of Sciences. The telescopes are located at CTA-N (La Palma),
+(Photometric Robotic Atmospheric Monitor) operated by FZU Institute of Physics of the Czech Academy of Sciences. The telescopes are located at CTA-N (La Palma),
 Auger (Argentina) and CTA-S (Paranal, Chile).
 
 The pipeline extracts metadata from FITS observation files, validates and enriches
 it with image-derived quantities (FWHM, sky position, image statistics), and
-publishes records to the [Physica.science](https://physica.science) repository
-(InvenioRDM). Over 5 million records covering ~200 TB of data from 2007 onward
-have been processed with this software (FRAMDATASET-01).
+publishes records to the [Physica](https://invenio.fzu.cz) repository
+(InvenioRDM).
 
 ---
 
@@ -124,9 +122,9 @@ python3 fram_upload.py \
     --stats-path logs/upload_stats.csv
 ```
 
-Dry run first (no network needed):
+Dry run first (no network needed, no token required):
 ```bash
-python3 fram_upload.py --environment production --data-root /mnt/data3 --dry-run
+python3 fram_upload.py --environment test1 --data-root /mnt/data3/cta-n/2024 --dry-run
 ```
 
 ### 4. Compress FITS files
@@ -157,12 +155,15 @@ details):
 
 1. **Observatory level** — frames that failed astrometric solving are placed in
    `bad/` subdirectories by the site software. The pipeline skips them via
-   `--exclude-dirs bad` (the default).
+   `--exclude-dirs bad` (the default). A valid astrometric solution (WCS) is
+   the primary quality indicator at FRAM: its absence signals hardware problems
+   or poor observing conditions (clouds, tracking failures). This is therefore
+   the main quality gate for science frames.
 2. **Pipeline level** — `validate_metadata()` rejects frames with unknown
    `IMAGETYP` (`E_BAD_TYPE`), missing required fields (`E_MISSING_FIELD`),
    unreadable files (`E_UNREADABLE`), implausible dates (`E_BAD_DATE_RANGE`),
    and optionally science frames without a WCS solution (`E_NO_WCS` with
-   `--require-wcs`).
+   `--require-wcs` — useful when `bad/` sorting has not been applied).
 
 Rejected files are recorded in `errors.csv` with a reason code; they are never
 silently skipped.
