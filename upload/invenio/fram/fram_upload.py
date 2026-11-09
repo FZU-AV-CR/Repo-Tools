@@ -107,7 +107,7 @@ HEALPIX_NSIDE = 64  # ~0.9 degree cell resolution; 49,152 total pixels
 # their own records too.
 CALIBRATION_IMAGETYPES = {
     "masterdark", "masterflat", "bias", "dcurrent",  # master / derived frames
-    "dark", "flat", "zero", "flat1",                  # raw calibration exposures
+    "dark", "flat", "zero",                  # raw calibration exposures
 }
 
 # Complete set of IMAGETYP values this pipeline accepts. Any frame whose
@@ -812,7 +812,7 @@ def validate_metadata(extracted: dict) -> list[str]:
     metadata for that instead of discarding frames.
 
     E_BAD_TYPE is emitted when IMAGETYP is not in KNOWN_IMAGETYPES (i.e. not
-    one of: object, dark, flat, zero, flat1, masterdark, masterflat, bias,
+    one of: object, dark, flat, zero, masterdark, masterflat, bias,
     dcurrent). Frames with a missing IMAGETYP keyword get obs_type="unknown"
     from extract_metadata() and are therefore also rejected.
 
